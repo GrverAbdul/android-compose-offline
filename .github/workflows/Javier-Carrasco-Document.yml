@@ -1,1 +1,261 @@
 
+name: Descargar documentacion completa Javier Carrasco
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  descargar:
+    name: Descargar documentacion completa
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      # 1. Descargar instalador oficial
+      - name: Descargar instalador oficial de Cyotek WebCopy
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $url = "https://www.cyotek.com/downloads/get/setup-cyowcopy-1.9.1.872-x64.exe"
+          $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
+
+          Write-Host "Descargando Cyotek WebCopy..."
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $expected = "8b5dfdce50f95a26dea849aacc355efae459cbb2360de19fcf1a33b266f8cce0"
+          $actual = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          if ($actual -ne $expected) {
+            throw "El SHA256 del instalador no coincide."
+          }
+
+          Write-Host "Instalador verificado correctamente."
+
+      # 2. Instalar WebCopy
+      - name: Instalar Cyotek WebCopy
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
+          $installDir = "C:\Cyotek\WebCopy"
+          $installLog = "$env:RUNNER_TEMP\cyotek-install.log"
+
+          Write-Host "Iniciando instalacion..."
+
+          $arguments = @(
+            "/VERYSILENT"
+            "/SUPPRESSMSGBOXES"
+            "/NORESTART"
+            "/SP-"
+            "/DIR=$installDir"
+            "/LOG=$installLog"
+          )
+
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList $arguments `
+            -PassThru
+
+          if (-not $process.WaitForExit(180000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+
+            if (Test-Path $installLog) {
+              Get-Content $installLog -Tail 40
+            }
+
+            throw "Instalacion detenida por timeout."
+          }
+
+          if ($process.ExitCode -ne 0) {
+            if (Test-Path $installLog) {
+              Get-Content $installLog -Tail 40
+            }
+
+            throw "Error de instalacion: $($process.ExitCode)"
+          }
+
+          $wcopy = Join-Path $installDir "wcopy.exe"
+
+          if (-not (Test-Path $wcopy)) {
+            throw "No se encontro wcopy.exe."
+          }
+
+          "WCOPY_PATH=$wcopy" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Write-Host "WebCopy instalado correctamente."
+
+      # 3. Preparar carpetas
+      - name: Preparar carpetas
+        shell: pwsh
+        run: |
+          $base = "$env:GITHUB_WORKSPACE\javier-carrasco-es"
+
+          $folders = @(
+            "$base\documentacion"
+            "$base\apis"
+          )
+
+          foreach ($folder in $folders) {
+            New-Item -ItemType Directory -Path $folder -Force |
+              Out-Null
+
+            Write-Host "Carpeta preparada: $folder"
+          }
+
+      # 4. Descargar ambos sitios
+      - name: Descargar documentacion principal y APIs
+        id: webcopy
+        continue-on-error: true
+        shell: pwsh
+        timeout-minutes: 330
+        run: |
+          $base = "$env:GITHUB_WORKSPACE\javier-carrasco-es"
+
+          $downloads = @(
+            @{
+              Name = "Documentacion principal"
+              Url = "https://documentation.javiercarrasco.es/"
+              Output = "$base\documentacion"
+              Log = "$env:GITHUB_WORKSPACE\webcopy-javier-documentacion.log"
+            },
+            @{
+              Name = "Documentacion de APIs"
+              Url = "https://api.javiercarrasco.es/"
+              Output = "$base\apis"
+              Log = "$env:GITHUB_WORKSPACE\webcopy-javier-api.log"
+            }
+          )
+
+          $exitCodes = @()
+
+          foreach ($download in $downloads) {
+
+            Write-Host ""
+            Write-Host "=========================================="
+            Write-Host "INICIANDO: $($download.Name)"
+            Write-Host "URL: $($download.Url)"
+            Write-Host "=========================================="
+
+            & "$env:WCOPY_PATH" `
+              $download.Url `
+              /mode Domain `
+              /recursive `
+              /o $download.Output `
+              /LOG $download.Log `
+              /STATISTICS
+
+            $exitCode = $LASTEXITCODE
+            $exitCodes += $exitCode
+
+            Write-Host "Resultado de $($download.Name): $exitCode"
+
+            if ($exitCode -eq 0) {
+              Write-Host "Descarga completada."
+            }
+            else {
+              Write-Host "La descarga termino con errores."
+            }
+          }
+
+          $results = @(
+            "RESULTADOS DE WEB COPY"
+            "Fecha: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            ""
+            "Documentacion principal: $($exitCodes[0])"
+            "Documentacion de APIs: $($exitCodes[1])"
+          )
+
+          $results |
+            Out-File "$env:GITHUB_WORKSPACE\resultado-descarga.txt" -Encoding utf8
+
+          if ($exitCodes | Where-Object { $_ -ne 0 }) {
+            throw "Una o mas descargas terminaron con errores."
+          }
+
+      # 5. Estadisticas completas
+      - name: Generar estadisticas e inventario
+        if: always()
+        shell: pwsh
+        run: |
+          $base = "$env:GITHUB_WORKSPACE\javier-carrasco-es"
+          $summary = "$env:GITHUB_WORKSPACE\resumen-descarga.txt"
+
+          $lines = @()
+
+          foreach ($section in @("documentacion", "apis")) {
+
+            $folder = Join-Path $base $section
+
+            $lines += ""
+            $lines += "======================================"
+            $lines += "SECCION: $section"
+            $lines += "======================================"
+
+            if (Test-Path $folder) {
+
+              $files = @(Get-ChildItem $folder -Recurse -File)
+
+              $count = $files.Count
+              $size = ($files | Measure-Object Length -Sum).Sum
+
+              $html = @($files | Where-Object {
+                $_.Extension -in @(".html", ".htm")
+              }).Count
+
+              $images = @($files | Where-Object {
+                $_.Extension -in @(".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")
+              }).Count
+
+              $lines += "Archivos totales: $count"
+              $lines += "Paginas HTML: $html"
+              $lines += "Imagenes: $images"
+              $lines += "Tamano: $([math]::Round($size / 1MB, 2)) MB"
+
+              Write-Host "$section - Archivos: $count"
+              Write-Host "$section - HTML: $html"
+              Write-Host "$section - Imagenes: $images"
+              Write-Host "$section - Tamano: $([math]::Round($size / 1MB, 2)) MB"
+
+              $lines += ""
+              $lines += "Archivos por extension:"
+
+              $groups = $files |
+                Group-Object Extension |
+                Sort-Object Count -Descending
+
+              foreach ($group in $groups) {
+                $lines += "$($group.Name): $($group.Count)"
+              }
+            }
+            else {
+              $lines += "La carpeta no existe."
+            }
+          }
+
+          $lines |
+            Out-File $summary -Encoding utf8
+
+          Write-Host ""
+          Write-Host "Estadisticas guardadas."
+
+      # 6. Publicar todo
+      - name: Crear archivo descargable
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Javier-Carrasco-Documentacion-Completa
+          path: |
+            javier-carrasco-es/
+            webcopy-javier-documentacion.log
+            webcopy-javier-api.log
+            resultado-descarga.txt
+            resumen-descarga.txt
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
+
