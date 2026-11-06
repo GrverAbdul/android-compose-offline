@@ -14,11 +14,15 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      # 1. Descargar el instalador oficial
       - name: Descargar instalador oficial de Cyotek WebCopy
         shell: pwsh
+        timeout-minutes: 5
         run: |
           $url = "https://www.cyotek.com/downloads/get/setup-cyowcopy-1.9.1.872-x64.exe"
           $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
+
+          Write-Host "Descargando Cyotek WebCopy..."
 
           Invoke-WebRequest -Uri $url -OutFile $installer
 
@@ -29,36 +33,69 @@ jobs:
             throw "El SHA256 del instalador no coincide."
           }
 
-          Write-Host "Instalador verificado correctamente."
+          Write-Host "Instalador descargado y verificado."
 
+      # 2. Instalar Cyotek WebCopy
       - name: Instalar Cyotek WebCopy
         shell: pwsh
+        timeout-minutes: 5
         run: |
           $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
+          $installDir = "C:\Cyotek\WebCopy"
+          $installLog = "$env:RUNNER_TEMP\cyotek-install.log"
 
-          $process = Start-Process -FilePath $installer `
-            -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" `
-            -Wait -PassThru
+          Write-Host "Iniciando instalacion..."
+
+          $arguments = @(
+            "/VERYSILENT"
+            "/SUPPRESSMSGBOXES"
+            "/NORESTART"
+            "/SP-"
+            "/DIR=$installDir"
+            "/LOG=$installLog"
+          )
+
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList $arguments `
+            -PassThru
+
+          Write-Host "Esperando al instalador..."
+
+          if (-not $process.WaitForExit(180000)) {
+            Write-Host "Tiempo limite superado."
+
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+
+            if (Test-Path $installLog) {
+              Get-Content $installLog -Tail 40
+            }
+
+            throw "Instalacion detenida por timeout."
+          }
 
           if ($process.ExitCode -ne 0) {
-            throw "Error instalando Cyotek WebCopy: $($process.ExitCode)"
+            if (Test-Path $installLog) {
+              Get-Content $installLog -Tail 40
+            }
+
+            throw "Error de instalacion: $($process.ExitCode)"
           }
 
-          $found = Get-ChildItem `
-            "C:\Program Files", "C:\Program Files (x86)" `
-            -Filter "wcopy.exe" -File -Recurse `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+          $wcopy = Join-Path $installDir "wcopy.exe"
 
-          if (-not $found) {
-            throw "No se encontro wcopy.exe"
+          if (-not (Test-Path $wcopy)) {
+            Get-ChildItem $installDir -Recurse -Filter "wcopy.exe"
+            throw "No se encontro wcopy.exe."
           }
 
-          "WCOPY_PATH=$($found.FullName)" |
+          "WCOPY_PATH=$wcopy" |
             Out-File -FilePath $env:GITHUB_ENV -Append
 
-          Write-Host "WebCopy encontrado: $($found.FullName)"
+          Write-Host "Cyotek WebCopy instalado correctamente."
+          Write-Host "Ruta: $wcopy"
 
+      # 3. Preparar carpeta de destino
       - name: Preparar carpetas
         shell: pwsh
         run: |
@@ -67,17 +104,22 @@ jobs:
           New-Item -ItemType Directory -Path $output -Force |
             Out-Null
 
-          Write-Host "Carpeta de destino preparada."
+          Write-Host "Carpeta preparada: $output"
 
+      # 4. Descargar documentacion
       - name: Descargar documentacion con WebCopy
         id: webcopy
         continue-on-error: true
         shell: pwsh
+        timeout-minutes: 300
         run: |
           $url = "https://developer.android.com/develop/ui?hl=es"
 
           $output = "$env:GITHUB_WORKSPACE\android-compose-es"
           $log = "$env:GITHUB_WORKSPACE\webcopy.log"
+
+          Write-Host "Iniciando descarga..."
+          Write-Host "URL: $url"
 
           & "$env:WCOPY_PATH" `
             $url `
@@ -96,6 +138,7 @@ jobs:
           "Codigo de salida WebCopy: $exitCode" |
             Out-File "$output\resultado.txt"
 
+      # 5. Mostrar estadisticas
       - name: Mostrar estadisticas
         if: always()
         shell: pwsh
@@ -105,15 +148,17 @@ jobs:
           if (Test-Path $folder) {
             $files = Get-ChildItem $folder -Recurse -File
 
-            Write-Host "Archivos descargados: $($files.Count)"
-
+            $count = $files.Count
             $size = ($files | Measure-Object Length -Sum).Sum
+
+            Write-Host "Archivos descargados: $count"
 
             if ($size) {
               Write-Host "Tamano total: $([math]::Round($size / 1MB, 2)) MB"
             }
           }
 
+      # 6. Publicar ZIP como Artifact
       - name: Crear archivo descargable
         if: always()
         uses: actions/upload-artifact@v7
@@ -125,4 +170,3 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
           compression-level: 6
-
