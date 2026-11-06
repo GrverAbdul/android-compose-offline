@@ -123,7 +123,6 @@ jobs:
             /mode Domain `
             /recursive `
             /o $output `
-            /header "Accept-Language: es-ES,es;q=0.9" `
             /LOG $log `
             /STATISTICS
 
