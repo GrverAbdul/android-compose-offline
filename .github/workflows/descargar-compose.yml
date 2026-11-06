@@ -1,1 +1,128 @@
 
+name: Descargar Android Compose en espanol
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  descargar:
+    name: Descargar documentacion Android
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Descargar instalador oficial de Cyotek WebCopy
+        shell: pwsh
+        run: |
+          $url = "https://www.cyotek.com/downloads/get/setup-cyowcopy-1.9.1.872-x64.exe"
+          $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $expected = "8b5dfdce50f95a26dea849aacc355efae459cbb2360de19fcf1a33b266f8cce0"
+          $actual = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          if ($actual -ne $expected) {
+            throw "El SHA256 del instalador no coincide."
+          }
+
+          Write-Host "Instalador verificado correctamente."
+
+      - name: Instalar Cyotek WebCopy
+        shell: pwsh
+        run: |
+          $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
+
+          $process = Start-Process -FilePath $installer `
+            -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" `
+            -Wait -PassThru
+
+          if ($process.ExitCode -ne 0) {
+            throw "Error instalando Cyotek WebCopy: $($process.ExitCode)"
+          }
+
+          $found = Get-ChildItem `
+            "C:\Program Files", "C:\Program Files (x86)" `
+            -Filter "wcopy.exe" -File -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (-not $found) {
+            throw "No se encontro wcopy.exe"
+          }
+
+          "WCOPY_PATH=$($found.FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Write-Host "WebCopy encontrado: $($found.FullName)"
+
+      - name: Preparar carpetas
+        shell: pwsh
+        run: |
+          $output = "$env:GITHUB_WORKSPACE\android-compose-es"
+
+          New-Item -ItemType Directory -Path $output -Force |
+            Out-Null
+
+          Write-Host "Carpeta de destino preparada."
+
+      - name: Descargar documentacion con WebCopy
+        id: webcopy
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $url = "https://developer.android.com/develop/ui?hl=es"
+
+          $output = "$env:GITHUB_WORKSPACE\android-compose-es"
+          $log = "$env:GITHUB_WORKSPACE\webcopy.log"
+
+          & "$env:WCOPY_PATH" `
+            $url `
+            /mode Domain `
+            /recursive `
+            /o $output `
+            /header "Accept-Language: es-ES,es;q=0.9" `
+            /max-concurrent-requests 4 `
+            /LOG $log `
+            /STATISTICS
+
+          $exitCode = $LASTEXITCODE
+
+          Write-Host "Codigo de salida WebCopy: $exitCode"
+
+          "Codigo de salida WebCopy: $exitCode" |
+            Out-File "$output\resultado.txt"
+
+      - name: Mostrar estadisticas
+        if: always()
+        shell: pwsh
+        run: |
+          $folder = "$env:GITHUB_WORKSPACE\android-compose-es"
+
+          if (Test-Path $folder) {
+            $files = Get-ChildItem $folder -Recurse -File
+
+            Write-Host "Archivos descargados: $($files.Count)"
+
+            $size = ($files | Measure-Object Length -Sum).Sum
+
+            if ($size) {
+              Write-Host "Tamano total: $([math]::Round($size / 1MB, 2)) MB"
+            }
+          }
+
+      - name: Crear archivo descargable
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Android-Compose-Espanol
+          path: |
+            android-compose-es/
+            webcopy.log
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
+
