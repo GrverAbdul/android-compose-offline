@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # 1. Descargar el instalador oficial
+      # 1. Descargar instalador oficial
       - name: Descargar instalador oficial de Cyotek WebCopy
         shell: pwsh
         timeout-minutes: 5
@@ -35,7 +35,7 @@ jobs:
 
           Write-Host "Instalador descargado y verificado."
 
-      # 2. Instalar Cyotek WebCopy
+      # 2. Instalar WebCopy
       - name: Instalar Cyotek WebCopy
         shell: pwsh
         timeout-minutes: 5
@@ -63,8 +63,6 @@ jobs:
           Write-Host "Esperando al instalador..."
 
           if (-not $process.WaitForExit(180000)) {
-            Write-Host "Tiempo limite superado."
-
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
 
             if (Test-Path $installLog) {
@@ -85,7 +83,6 @@ jobs:
           $wcopy = Join-Path $installDir "wcopy.exe"
 
           if (-not (Test-Path $wcopy)) {
-            Get-ChildItem $installDir -Recurse -Filter "wcopy.exe"
             throw "No se encontro wcopy.exe."
           }
 
@@ -95,7 +92,7 @@ jobs:
           Write-Host "Cyotek WebCopy instalado correctamente."
           Write-Host "Ruta: $wcopy"
 
-      # 3. Preparar carpeta de destino
+      # 3. Preparar carpeta
       - name: Preparar carpetas
         shell: pwsh
         run: |
@@ -119,7 +116,7 @@ jobs:
           $log = "$env:GITHUB_WORKSPACE\webcopy.log"
 
           Write-Host "Iniciando descarga..."
-          Write-Host "URL: $url"
+          Write-Host "URL inicial: $url"
 
           & "$env:WCOPY_PATH" `
             $url `
@@ -127,7 +124,6 @@ jobs:
             /recursive `
             /o $output `
             /header "Accept-Language: es-ES,es;q=0.9" `
-            /max-concurrent-requests 4 `
             /LOG $log `
             /STATISTICS
 
@@ -138,7 +134,11 @@ jobs:
           "Codigo de salida WebCopy: $exitCode" |
             Out-File "$output\resultado.txt"
 
-      # 5. Mostrar estadisticas
+          if ($exitCode -ne 0) {
+            throw "WebCopy termino con el codigo de error $exitCode."
+          }
+
+      # 5. Estadisticas
       - name: Mostrar estadisticas
         if: always()
         shell: pwsh
@@ -158,7 +158,13 @@ jobs:
             }
           }
 
-      # 6. Publicar ZIP como Artifact
+          $log = "$env:GITHUB_WORKSPACE\webcopy.log"
+
+          if (Test-Path $log) {
+            Write-Host "Registro de WebCopy disponible."
+          }
+
+      # 6. Publicar resultado
       - name: Crear archivo descargable
         if: always()
         uses: actions/upload-artifact@v7
