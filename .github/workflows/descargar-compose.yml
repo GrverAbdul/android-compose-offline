@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   descargar:
-    name: Descargar Android UI y Jetpack Compose
+    name: Descargar documentacion Android UI
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -20,7 +20,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y httrack
-
           httrack --version
 
       # 2. Preparar carpetas
@@ -40,20 +39,19 @@ jobs:
           set -o pipefail
 
           httrack "$URL" \
-            --path "$OUTPUT" \
-            --stay-on-same-address \
+            -O "$OUTPUT" \
+            --go-everywhere \
             --include-query-string \
-            --extended-parsing=1 \
             --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36" \
             --language "es-ES,es;q=0.9" \
+            --verbose \
+            "-*" \
             "+developer.android.com/develop/ui*" \
+            "-developer.android.com/develop/ui*hl=*" \
+            "+developer.android.com/develop/ui*hl=es*" \
             "+developer.android.com/static/*" \
             "+www.gstatic.com/devrel-devsite/*" \
-            "-mime:text/html" \
-            "-*hl=*" \
-            "+developer.android.com/develop/ui*hl=es*" \
-            "+www.gstatic.com/devrel-devsite/*hl=es*" \
-            -v 2>&1 | tee httrack-console.log
+            2>&1 | tee httrack-console.log
 
       # 4. Analizar archivos descargados
       - name: Analizar recursos
@@ -77,7 +75,6 @@ jobs:
 
           files = [p for p in folder.rglob("*") if p.is_file()]
           counts = Counter(p.suffix.lower() for p in files)
-
           total_size = sum(p.stat().st_size for p in files)
 
           lines = [
@@ -94,14 +91,14 @@ jobs:
 
           lines.extend([
               "",
-              "COMPROBACION DE CARPETAS:",
+              "COMPROBACION DE DIRECTORIOS:",
               f"Carpeta principal: {folder.exists()}",
-              f"Registro HTTrack: {(folder / 'hts-log.txt').exists()}",
-              f"Registro de errores: {(folder / 'hts-err.txt').exists()}"
+              f"Archivos HTML: {counts['.html'] + counts['.htm']}",
+              f"Archivos CSS: {counts['.css']}",
+              f"Archivos JS: {counts['.js']}"
           ])
 
           report.write_text("\n".join(lines), encoding="utf-8")
-
           print("\n".join(lines))
           PY
 
