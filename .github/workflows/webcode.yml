@@ -1,5 +1,5 @@
 
-name: Descargar documentacion completa WebCode
+name: Descargar WebCode en espanol
 
 on:
   workflow_dispatch:
@@ -9,235 +9,118 @@ permissions:
 
 jobs:
   descargar:
-    name: Descargar WebCode en espanol
-    runs-on: windows-latest
-    timeout-minutes: 360
+    name: Descargar documentacion WebCode
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
 
     steps:
-      # 1. Descargar instalador oficial
-      - name: Descargar instalador oficial de Cyotek WebCopy
-        shell: pwsh
-        timeout-minutes: 5
+      - name: Instalar HTTrack
+        shell: bash
         run: |
-          $url = "https://www.cyotek.com/downloads/get/setup-cyowcopy-1.9.1.872-x64.exe"
-          $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
+          sudo apt-get update
+          sudo apt-get install -y httrack
+          httrack --version
 
-          Write-Host "Descargando Cyotek WebCopy..."
-
-          Invoke-WebRequest -Uri $url -OutFile $installer
-
-          $expected = "8b5dfdce50f95a26dea849aacc355efae459cbb2360de19fcf1a33b266f8cce0"
-          $actual = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
-
-          if ($actual -ne $expected) {
-            throw "El SHA256 del instalador no coincide."
-          }
-
-          Write-Host "Instalador descargado y verificado."
-
-      # 2. Instalar WebCopy
-      - name: Instalar Cyotek WebCopy
-        shell: pwsh
-        timeout-minutes: 5
-        run: |
-          $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
-          $installDir = "C:\Cyotek\WebCopy"
-          $installLog = "$env:RUNNER_TEMP\cyotek-install.log"
-
-          Write-Host "Iniciando instalacion..."
-
-          $arguments = @(
-            "/VERYSILENT"
-            "/SUPPRESSMSGBOXES"
-            "/NORESTART"
-            "/SP-"
-            "/DIR=$installDir"
-            "/LOG=$installLog"
-          )
-
-          $process = Start-Process `
-            -FilePath $installer `
-            -ArgumentList $arguments `
-            -PassThru
-
-          if (-not $process.WaitForExit(180000)) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-
-            if (Test-Path $installLog) {
-              Get-Content $installLog -Tail 40
-            }
-
-            throw "Instalacion detenida por timeout."
-          }
-
-          if ($process.ExitCode -ne 0) {
-            if (Test-Path $installLog) {
-              Get-Content $installLog -Tail 40
-            }
-
-            throw "Error de instalacion: $($process.ExitCode)"
-          }
-
-          $wcopy = Join-Path $installDir "wcopy.exe"
-
-          if (-not (Test-Path $wcopy)) {
-            throw "No se encontro wcopy.exe."
-          }
-
-          "WCOPY_PATH=$wcopy" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
-
-          Write-Host "Cyotek WebCopy instalado correctamente."
-          Write-Host "Ruta: $wcopy"
-
-      # 3. Preparar carpetas
       - name: Preparar carpetas
-        shell: pwsh
+        shell: bash
         run: |
-          $output = "$env:GITHUB_WORKSPACE\webcode-es"
+          mkdir -p webcode-offline
 
-          New-Item -ItemType Directory -Path $output -Force |
-            Out-Null
-
-          Write-Host "Carpeta preparada: $output"
-
-      # 4. Descargar el sitio completo
-      - name: Descargar WebCode con WebCopy
-        id: webcopy
-        continue-on-error: true
-        shell: pwsh
-        timeout-minutes: 330
+      - name: Comprobar acceso al sitio
+        shell: bash
         run: |
-          $url = "https://webcode.net.pe/web/index.html"
+          URL="https://webcode.net.pe/web/index.html"
 
-          $output = "$env:GITHUB_WORKSPACE\webcode-es"
-          $log = "$env:GITHUB_WORKSPACE\webcopy-webcode.log"
+          echo "Comprobando acceso..."
 
-          Write-Host "=========================================="
-          Write-Host "DESCARGA COMPLETA DE WEBCODE"
-          Write-Host "=========================================="
-          Write-Host "URL inicial: $url"
-          Write-Host "Dominio: webcode.net.pe"
-          Write-Host "Idioma: Espanol"
-          Write-Host "Modo: Domain"
-          Write-Host "=========================================="
+          curl -sS -L \
+            --max-redirs 10 \
+            -o pagina-prueba.html \
+            -w "\nHTTP final: %{http_code}\nURL final: %{url_effective}\nTipo de contenido: %{content_type}\n" \
+            "$URL"
 
-          & "$env:WCOPY_PATH" `
-            $url `
-            /mode Domain `
-            /recursive `
-            /o $output `
-            /LOG $log `
-            /STATISTICS
+          if ! grep -qiE '<html|<!doctype html' pagina-prueba.html; then
+            echo "ERROR: No se recibio HTML."
+            exit 1
+          fi
 
-          $exitCode = $LASTEXITCODE
+          echo "Acceso correcto."
 
-          Write-Host "Codigo de salida WebCopy: $exitCode"
+      - name: Descargar sitio con HTTrack
+        shell: bash
+        timeout-minutes: 165
+        run: |
+          URL="https://webcode.net.pe/web/index.html"
+          OUTPUT="webcode-offline"
 
-          @(
-            "Resultado de WebCopy: $exitCode"
-            "URL inicial: $url"
-            "Dominio: webcode.net.pe"
-            "Fecha: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-          ) | Out-File "$output\resultado.txt" -Encoding utf8
+          set -o pipefail
 
-          if ($exitCode -ne 0) {
-            throw "WebCopy termino con el codigo de error $exitCode."
-          }
+          httrack "$URL" \
+            -O "$OUTPUT" \
+            --stay-on-same-address \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36" \
+            --verbose \
+            --file-log \
+            --extra-log \
+            -r5 \
+            2>&1 | tee httrack-console.log
 
-      # 5. Generar estadisticas
-      - name: Generar estadisticas e inventario
+      - name: Analizar descarga
         if: always()
-        shell: pwsh
+        shell: bash
         run: |
-          $folder = "$env:GITHUB_WORKSPACE\webcode-es"
-          $summary = "$env:GITHUB_WORKSPACE\resumen-webcode.txt"
+          python3 - <<'PY'
+          from pathlib import Path
+          from collections import Counter
 
-          $lines = @()
+          folder = Path("webcode-offline")
 
-          if (Test-Path $folder) {
+          files = [p for p in folder.rglob("*") if p.is_file()]
+          counts = Counter(p.suffix.lower() for p in files)
+          total_size = sum(p.stat().st_size for p in files)
 
-            $files = @(Get-ChildItem $folder -Recurse -File)
+          extensions = [
+              ".html", ".htm", ".css", ".js",
+              ".png", ".jpg", ".jpeg", ".webp",
+              ".gif", ".svg", ".ico",
+              ".woff", ".woff2", ".ttf", ".otf",
+              ".json", ".xml", ".pdf"
+          ]
 
-            $count = $files.Count
-            $size = ($files | Measure-Object Length -Sum).Sum
+          lines = [
+              "INFORME DE DESCARGA WEBCODE",
+              "",
+              f"Total de archivos: {len(files)}",
+              f"Tamano total: {total_size / (1024 * 1024):.2f} MB",
+              "",
+              "RECURSOS POR EXTENSION:"
+          ]
 
-            $html = @($files | Where-Object {
-              $_.Extension -in @(".html", ".htm")
-            }).Count
+          for ext in extensions:
+              lines.append(f"{ext}: {counts[ext]}")
 
-            $images = @($files | Where-Object {
-              $_.Extension -in @(
-                ".png", ".jpg", ".jpeg", ".gif",
-                ".webp", ".svg", ".ico"
-              )
-            }).Count
+          lines.extend([
+              "",
+              f"HTML total: {counts['.html'] + counts['.htm']}",
+              f"CSS total: {counts['.css']}",
+              f"JavaScript total: {counts['.js']}"
+          ])
 
-            $css = @($files | Where-Object {
-              $_.Extension -eq ".css"
-            }).Count
+          report = "\n".join(lines)
+          Path("informe-recursos.txt").write_text(report, encoding="utf-8")
+          print(report)
+          PY
 
-            $javascript = @($files | Where-Object {
-              $_.Extension -in @(".js", ".mjs")
-            }).Count
-
-            $pdf = @($files | Where-Object {
-              $_.Extension -eq ".pdf"
-            }).Count
-
-            $lines += "ESTADISTICAS DE WEBCODE"
-            $lines += "Fecha: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-            $lines += ""
-            $lines += "Archivos totales: $count"
-            $lines += "Paginas HTML: $html"
-            $lines += "Imagenes: $images"
-            $lines += "Archivos CSS: $css"
-            $lines += "Archivos JavaScript: $javascript"
-            $lines += "Documentos PDF: $pdf"
-            $lines += "Tamano total: $([math]::Round($size / 1MB, 2)) MB"
-            $lines += "Tamano en GB: $([math]::Round($size / 1GB, 3)) GB"
-            $lines += ""
-            $lines += "ARCHIVOS POR EXTENSION"
-
-            $groups = $files |
-              Group-Object Extension |
-              Sort-Object Count -Descending
-
-            foreach ($group in $groups) {
-              $lines += "$($group.Name): $($group.Count)"
-            }
-
-            Write-Host "=========================================="
-            Write-Host "ESTADISTICAS DE DESCARGA"
-            Write-Host "=========================================="
-            Write-Host "Archivos: $count"
-            Write-Host "Paginas HTML: $html"
-            Write-Host "Imagenes: $images"
-            Write-Host "CSS: $css"
-            Write-Host "JavaScript: $javascript"
-            Write-Host "PDF: $pdf"
-            Write-Host "Tamano: $([math]::Round($size / 1MB, 2)) MB"
-          }
-          else {
-            $lines += "No se encontro la carpeta de descarga."
-          }
-
-          $lines |
-            Out-File $summary -Encoding utf8
-
-          Write-Host "Resumen guardado."
-
-      # 6. Publicar resultado
-      - name: Crear archivo descargable
+      - name: Guardar descarga
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: WebCode-Documentacion-Espanol
+          name: WebCode-Documentacion
           path: |
-            webcode-es/
-            webcopy-webcode.log
-            resumen-webcode.txt
+            webcode-offline/
+            httrack-console.log
+            informe-recursos.txt
+            pagina-prueba.html
           if-no-files-found: warn
           retention-days: 7
           compression-level: 6
-
