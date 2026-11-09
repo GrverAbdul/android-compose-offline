@@ -9,176 +9,111 @@ permissions:
 
 jobs:
   descargar:
-    name: Descargar documentacion Android UI
-    runs-on: windows-latest
+    name: Descargar Android UI y Jetpack Compose
+    runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      # 1. Descargar instalador oficial
-      - name: Descargar instalador oficial de Cyotek WebCopy
-        shell: pwsh
-        timeout-minutes: 5
+      # 1. Instalar HTTrack
+      - name: Instalar HTTrack
+        shell: bash
         run: |
-          $url = "https://www.cyotek.com/downloads/get/setup-cyowcopy-1.9.1.872-x64.exe"
-          $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
+          sudo apt-get update
+          sudo apt-get install -y httrack
 
-          Invoke-WebRequest -Uri $url -OutFile $installer
+          httrack --version
 
-          $expected = "8b5dfdce50f95a26dea849aacc355efae459cbb2360de19fcf1a33b266f8cce0"
-          $actual = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
-
-          if ($actual -ne $expected) {
-            throw "El SHA256 del instalador no coincide."
-          }
-
-          Write-Host "Instalador verificado."
-
-      # 2. Instalar WebCopy
-      - name: Instalar Cyotek WebCopy
-        shell: pwsh
-        timeout-minutes: 5
-        run: |
-          $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
-          $installDir = "C:\Cyotek\WebCopy"
-          $installLog = "$env:RUNNER_TEMP\cyotek-install.log"
-
-          $arguments = @(
-            "/VERYSILENT"
-            "/SUPPRESSMSGBOXES"
-            "/NORESTART"
-            "/SP-"
-            "/DIR=$installDir"
-            "/LOG=$installLog"
-          )
-
-          $process = Start-Process `
-            -FilePath $installer `
-            -ArgumentList $arguments `
-            -PassThru
-
-          if (-not $process.WaitForExit(180000)) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-            throw "Tiempo de instalacion agotado."
-          }
-
-          if ($process.ExitCode -ne 0) {
-            Get-Content $installLog -Tail 40
-            throw "Error instalando WebCopy."
-          }
-
-          $wcopy = Join-Path $installDir "wcopy.exe"
-
-          if (-not (Test-Path $wcopy)) {
-            throw "No se encontro wcopy.exe."
-          }
-
-          "WCOPY_PATH=$wcopy" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
-
-          Write-Host "Instalacion correcta."
-
-      # 3. Preparar carpetas
+      # 2. Preparar carpetas
       - name: Preparar carpetas
-        shell: pwsh
+        shell: bash
         run: |
-          $output = "$env:GITHUB_WORKSPACE\android-ui-es"
+          mkdir -p android-ui-es
 
-          New-Item -ItemType Directory -Path $output -Force |
-            Out-Null
-
-          Write-Host "Carpeta preparada."
-
-      # 4. Descargar documentación
-      - name: Descargar documentacion Android UI
-        id: download
-        shell: pwsh
-        timeout-minutes: 300
+      # 3. Descargar documentación
+      - name: Descargar Android UI en espanol
+        shell: bash
+        timeout-minutes: 330
         run: |
-          $url = "https://developer.android.com/develop/ui?hl=es"
-          $output = "$env:GITHUB_WORKSPACE\android-ui-es"
-          $log = "$env:GITHUB_WORKSPACE\webcopy.log"
+          URL="https://developer.android.com/develop/ui?hl=es"
+          OUTPUT="android-ui-es"
 
-          Write-Host "URL inicial: $url"
-          Write-Host "Modo: Domain"
-          Write-Host "Descarga recursiva activada."
+          set -o pipefail
 
-          & "$env:WCOPY_PATH" `
-            $url `
-            /mode Domain `
-            /recursive `
-            /o $output `
-            /LOG $log `
-            /STATISTICS
+          httrack "$URL" \
+            --path "$OUTPUT" \
+            --stay-on-same-address \
+            --include-query-string \
+            --extended-parsing=1 \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36" \
+            --language "es-ES,es;q=0.9" \
+            "+developer.android.com/develop/ui*" \
+            "+developer.android.com/static/*" \
+            "+www.gstatic.com/devrel-devsite/*" \
+            "-mime:text/html" \
+            "-*hl=*" \
+            "+developer.android.com/develop/ui*hl=es*" \
+            "+www.gstatic.com/devrel-devsite/*hl=es*" \
+            -v 2>&1 | tee httrack-console.log
 
-          $exitCode = $LASTEXITCODE
-
-          Write-Host "Codigo de salida: $exitCode"
-
-          "Codigo de salida: $exitCode" |
-            Out-File "$output\resultado.txt"
-
-          if ($exitCode -ne 0) {
-            throw "WebCopy finalizo con error $exitCode."
-          }
-
-      # 5. Comprobar archivos y recursos
-      - name: Analizar contenido descargado
+      # 4. Analizar archivos descargados
+      - name: Analizar recursos
         if: always()
-        shell: pwsh
+        shell: bash
         run: |
-          $folder = "$env:GITHUB_WORKSPACE\android-ui-es"
-          $report = "$env:GITHUB_WORKSPACE\informe-recursos.txt"
+          python3 - <<'PY'
+          from pathlib import Path
+          from collections import Counter
 
-          if (-not (Test-Path $folder)) {
-            throw "No existe la carpeta de descarga."
-          }
+          folder = Path("android-ui-es")
+          report = Path("informe-recursos.txt")
 
-          $files = Get-ChildItem $folder -Recurse -File
+          extensions = [
+              ".html", ".htm", ".css", ".js",
+              ".png", ".jpg", ".jpeg", ".webp",
+              ".gif", ".svg", ".ico",
+              ".woff", ".woff2", ".ttf", ".otf",
+              ".json", ".xml", ".pdf"
+          ]
 
-          $extensions = @(
-            ".html", ".htm", ".css", ".js",
-            ".png", ".jpg", ".jpeg", ".webp",
-            ".gif", ".svg", ".ico",
-            ".woff", ".woff2", ".ttf", ".otf"
-          )
+          files = [p for p in folder.rglob("*") if p.is_file()]
+          counts = Counter(p.suffix.lower() for p in files)
 
-          $lines = [System.Collections.Generic.List[string]]::new()
+          total_size = sum(p.stat().st_size for p in files)
 
-          $lines.Add("INFORME DE DESCARGA ANDROID UI")
-          $lines.Add("Fecha: $(Get-Date)")
-          $lines.Add("")
+          lines = [
+              "INFORME DE DESCARGA ANDROID UI",
+              "",
+              f"Total de archivos: {len(files)}",
+              f"Tamano total: {total_size / (1024 * 1024):.2f} MB",
+              "",
+              "RECURSOS POR EXTENSION:"
+          ]
 
-          foreach ($extension in $extensions) {
-            $count = @(
-              $files | Where-Object {
-                $_.Extension -ieq $extension
-              }
-            ).Count
+          for ext in extensions:
+              lines.append(f"{ext}: {counts[ext]}")
 
-            $lines.Add("$extension : $count")
-          }
+          lines.extend([
+              "",
+              "COMPROBACION DE CARPETAS:",
+              f"Carpeta principal: {folder.exists()}",
+              f"Registro HTTrack: {(folder / 'hts-log.txt').exists()}",
+              f"Registro de errores: {(folder / 'hts-err.txt').exists()}"
+          ])
 
-          $totalSize = ($files | Measure-Object Length -Sum).Sum
+          report.write_text("\n".join(lines), encoding="utf-8")
 
-          $lines.Add("")
-          $lines.Add("Total de archivos: $($files.Count)")
-          $lines.Add("Tamano total MB: $([math]::Round($totalSize / 1MB, 2))")
+          print("\n".join(lines))
+          PY
 
-          $lines | Out-File $report -Encoding utf8
-
-          $lines | ForEach-Object { Write-Host $_ }
-
-          Copy-Item $report "$folder\informe-recursos.txt" -Force
-
-      # 6. Publicar resultado
-      - name: Crear archivo descargable
+      # 5. Publicar descarga
+      - name: Guardar documentacion descargada
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: Android-UI-Espanol
           path: |
             android-ui-es/
-            webcopy.log
+            httrack-console.log
             informe-recursos.txt
           if-no-files-found: warn
           retention-days: 7
