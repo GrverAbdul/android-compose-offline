@@ -1,5 +1,5 @@
 
-name: Descargar Android Compose en espanol
+name: Descargar Android UI en espanol
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   descargar:
-    name: Descargar documentacion Android
+    name: Descargar documentacion Android UI
     runs-on: windows-latest
     timeout-minutes: 360
 
@@ -22,8 +22,6 @@ jobs:
           $url = "https://www.cyotek.com/downloads/get/setup-cyowcopy-1.9.1.872-x64.exe"
           $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
 
-          Write-Host "Descargando Cyotek WebCopy..."
-
           Invoke-WebRequest -Uri $url -OutFile $installer
 
           $expected = "8b5dfdce50f95a26dea849aacc355efae459cbb2360de19fcf1a33b266f8cce0"
@@ -33,7 +31,7 @@ jobs:
             throw "El SHA256 del instalador no coincide."
           }
 
-          Write-Host "Instalador descargado y verificado."
+          Write-Host "Instalador verificado."
 
       # 2. Instalar WebCopy
       - name: Instalar Cyotek WebCopy
@@ -43,8 +41,6 @@ jobs:
           $installer = "$env:RUNNER_TEMP\cyotek-webcopy.exe"
           $installDir = "C:\Cyotek\WebCopy"
           $installLog = "$env:RUNNER_TEMP\cyotek-install.log"
-
-          Write-Host "Iniciando instalacion..."
 
           $arguments = @(
             "/VERYSILENT"
@@ -60,24 +56,14 @@ jobs:
             -ArgumentList $arguments `
             -PassThru
 
-          Write-Host "Esperando al instalador..."
-
           if (-not $process.WaitForExit(180000)) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-
-            if (Test-Path $installLog) {
-              Get-Content $installLog -Tail 40
-            }
-
-            throw "Instalacion detenida por timeout."
+            throw "Tiempo de instalacion agotado."
           }
 
           if ($process.ExitCode -ne 0) {
-            if (Test-Path $installLog) {
-              Get-Content $installLog -Tail 40
-            }
-
-            throw "Error de instalacion: $($process.ExitCode)"
+            Get-Content $installLog -Tail 40
+            throw "Error instalando WebCopy."
           }
 
           $wcopy = Join-Path $installDir "wcopy.exe"
@@ -89,34 +75,32 @@ jobs:
           "WCOPY_PATH=$wcopy" |
             Out-File -FilePath $env:GITHUB_ENV -Append
 
-          Write-Host "Cyotek WebCopy instalado correctamente."
-          Write-Host "Ruta: $wcopy"
+          Write-Host "Instalacion correcta."
 
-      # 3. Preparar carpeta
+      # 3. Preparar carpetas
       - name: Preparar carpetas
         shell: pwsh
         run: |
-          $output = "$env:GITHUB_WORKSPACE\android-compose-es"
+          $output = "$env:GITHUB_WORKSPACE\android-ui-es"
 
           New-Item -ItemType Directory -Path $output -Force |
             Out-Null
 
-          Write-Host "Carpeta preparada: $output"
+          Write-Host "Carpeta preparada."
 
-      # 4. Descargar documentacion
-      - name: Descargar documentacion con WebCopy
-        id: webcopy
-        continue-on-error: true
+      # 4. Descargar documentación
+      - name: Descargar documentacion Android UI
+        id: download
         shell: pwsh
         timeout-minutes: 300
         run: |
           $url = "https://developer.android.com/develop/ui?hl=es"
-
-          $output = "$env:GITHUB_WORKSPACE\android-compose-es"
+          $output = "$env:GITHUB_WORKSPACE\android-ui-es"
           $log = "$env:GITHUB_WORKSPACE\webcopy.log"
 
-          Write-Host "Iniciando descarga..."
           Write-Host "URL inicial: $url"
+          Write-Host "Modo: Domain"
+          Write-Host "Descarga recursiva activada."
 
           & "$env:WCOPY_PATH" `
             $url `
@@ -128,50 +112,74 @@ jobs:
 
           $exitCode = $LASTEXITCODE
 
-          Write-Host "Codigo de salida WebCopy: $exitCode"
+          Write-Host "Codigo de salida: $exitCode"
 
-          "Codigo de salida WebCopy: $exitCode" |
+          "Codigo de salida: $exitCode" |
             Out-File "$output\resultado.txt"
 
           if ($exitCode -ne 0) {
-            throw "WebCopy termino con el codigo de error $exitCode."
+            throw "WebCopy finalizo con error $exitCode."
           }
 
-      # 5. Estadisticas
-      - name: Mostrar estadisticas
+      # 5. Comprobar archivos y recursos
+      - name: Analizar contenido descargado
         if: always()
         shell: pwsh
         run: |
-          $folder = "$env:GITHUB_WORKSPACE\android-compose-es"
+          $folder = "$env:GITHUB_WORKSPACE\android-ui-es"
+          $report = "$env:GITHUB_WORKSPACE\informe-recursos.txt"
 
-          if (Test-Path $folder) {
-            $files = Get-ChildItem $folder -Recurse -File
-
-            $count = $files.Count
-            $size = ($files | Measure-Object Length -Sum).Sum
-
-            Write-Host "Archivos descargados: $count"
-
-            if ($size) {
-              Write-Host "Tamano total: $([math]::Round($size / 1MB, 2)) MB"
-            }
+          if (-not (Test-Path $folder)) {
+            throw "No existe la carpeta de descarga."
           }
 
-          $log = "$env:GITHUB_WORKSPACE\webcopy.log"
+          $files = Get-ChildItem $folder -Recurse -File
 
-          if (Test-Path $log) {
-            Write-Host "Registro de WebCopy disponible."
+          $extensions = @(
+            ".html", ".htm", ".css", ".js",
+            ".png", ".jpg", ".jpeg", ".webp",
+            ".gif", ".svg", ".ico",
+            ".woff", ".woff2", ".ttf", ".otf"
+          )
+
+          $lines = [System.Collections.Generic.List[string]]::new()
+
+          $lines.Add("INFORME DE DESCARGA ANDROID UI")
+          $lines.Add("Fecha: $(Get-Date)")
+          $lines.Add("")
+
+          foreach ($extension in $extensions) {
+            $count = @(
+              $files | Where-Object {
+                $_.Extension -ieq $extension
+              }
+            ).Count
+
+            $lines.Add("$extension : $count")
           }
+
+          $totalSize = ($files | Measure-Object Length -Sum).Sum
+
+          $lines.Add("")
+          $lines.Add("Total de archivos: $($files.Count)")
+          $lines.Add("Tamano total MB: $([math]::Round($totalSize / 1MB, 2))")
+
+          $lines | Out-File $report -Encoding utf8
+
+          $lines | ForEach-Object { Write-Host $_ }
+
+          Copy-Item $report "$folder\informe-recursos.txt" -Force
 
       # 6. Publicar resultado
       - name: Crear archivo descargable
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: Android-Compose-Espanol
+          name: Android-UI-Espanol
           path: |
-            android-compose-es/
+            android-ui-es/
             webcopy.log
+            informe-recursos.txt
           if-no-files-found: warn
           retention-days: 7
           compression-level: 6
