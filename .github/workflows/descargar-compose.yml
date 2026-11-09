@@ -14,7 +14,6 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # 1. Instalar HTTrack
       - name: Instalar HTTrack
         shell: bash
         run: |
@@ -22,19 +21,44 @@ jobs:
           sudo apt-get install -y httrack
           httrack --version
 
-      # 2. Preparar carpetas
       - name: Preparar carpetas
         shell: bash
         run: |
           mkdir -p android-ui-es
 
-      # 3. Descargar documentación
+      - name: Comprobar acceso a Android Developers
+        shell: bash
+        run: |
+          URL="https://developer.android.com/develop/ui?hl=es"
+          USER_AGENT="OpenCode-User/1.0"
+
+          echo "Comprobando acceso a la pagina..."
+          curl -sS -L \
+            --max-redirs 10 \
+            -A "$USER_AGENT" \
+            -o pagina-prueba.html \
+            -w "\nHTTP final: %{http_code}\nURL final: %{url_effective}\nTipo de contenido: %{content_type}\n" \
+            "$URL"
+
+          if grep -qiE 'oauth2callback|accounts\.google\.com' pagina-prueba.html; then
+            echo "ERROR: La pagina sigue redirigiendo a Google OAuth."
+            exit 1
+          fi
+
+          if ! grep -qiE '<html|<!doctype html' pagina-prueba.html; then
+            echo "ERROR: La respuesta no parece contener HTML."
+            exit 1
+          fi
+
+          echo "La pagina inicial responde con contenido HTML."
+
       - name: Descargar Android UI en espanol
         shell: bash
         timeout-minutes: 330
         run: |
           URL="https://developer.android.com/develop/ui?hl=es"
           OUTPUT="android-ui-es"
+          USER_AGENT="OpenCode-User/1.0"
 
           set -o pipefail
 
@@ -42,7 +66,7 @@ jobs:
             -O "$OUTPUT" \
             --go-everywhere \
             --include-query-string \
-            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36" \
+            --user-agent "$USER_AGENT" \
             --language "es-ES,es;q=0.9" \
             --verbose \
             "-*" \
@@ -53,8 +77,7 @@ jobs:
             "+www.gstatic.com/devrel-devsite/*" \
             2>&1 | tee httrack-console.log
 
-      # 4. Analizar archivos descargados
-      - name: Analizar recursos
+      - name: Analizar archivos descargados
         if: always()
         shell: bash
         run: |
@@ -102,7 +125,6 @@ jobs:
           print("\n".join(lines))
           PY
 
-      # 5. Publicar descarga
       - name: Guardar documentacion descargada
         if: always()
         uses: actions/upload-artifact@v7
@@ -112,6 +134,7 @@ jobs:
             android-ui-es/
             httrack-console.log
             informe-recursos.txt
+            pagina-prueba.html
           if-no-files-found: warn
           retention-days: 7
           compression-level: 6
