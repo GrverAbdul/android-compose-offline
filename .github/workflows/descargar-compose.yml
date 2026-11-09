@@ -1,5 +1,5 @@
 
-name: Diagnostico HTTrack Android
+name: Descargar Android UI en espanol
 
 on:
   workflow_dispatch:
@@ -8,81 +8,137 @@ permissions:
   contents: read
 
 jobs:
-  diagnostico:
+  descargar:
+    name: Descargar documentacion Android UI
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 360
 
     steps:
       - name: Instalar HTTrack
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y httrack
           httrack --version
 
-      - name: Comprobar acceso
+      - name: Preparar carpetas
+        shell: bash
+        run: |
+          mkdir -p android-ui-es
+
+      - name: Comprobar acceso a Android Developers
         shell: bash
         run: |
           URL="https://developer.android.com/develop/ui?hl=es"
           USER_AGENT="OpenCode-User/1.0"
+
+          echo "Comprobando acceso a la pagina..."
 
           curl -sS -L \
             --max-redirs 10 \
             -A "$USER_AGENT" \
             -o pagina-prueba.html \
-            -w "HTTP: %{http_code}\nURL: %{url_effective}\nTipo: %{content_type}\n" \
+            -w "\nHTTP final: %{http_code}\nURL final: %{url_effective}\nTipo de contenido: %{content_type}\n" \
             "$URL"
 
-      - name: Probar descarga individual con HTTrack
+          if grep -qiE 'oauth2callback|accounts\.google\.com' pagina-prueba.html; then
+            echo "ERROR: Redireccion a Google OAuth."
+            exit 1
+          fi
+
+          if ! grep -qiE '<html|<!doctype html' pagina-prueba.html; then
+            echo "ERROR: No se recibio HTML."
+            exit 1
+          fi
+
+          echo "Acceso correcto."
+
+      - name: Descargar documentacion con HTTrack
         shell: bash
-        timeout-minutes: 3
+        timeout-minutes: 330
         run: |
           URL="https://developer.android.com/develop/ui?hl=es"
-          USER_AGENT="OpenCode-User/1.0"
-
-          mkdir -p prueba-httrack
+          OUTPUT="android-ui-es"
 
           set -o pipefail
 
-          httrack \
-            --get "$URL" \
-            -O prueba-httrack \
-            --user-agent "$USER_AGENT" \
+          httrack "$URL" \
+            -O "$OUTPUT" \
+            --go-everywhere \
+            --include-query-string \
+            --user-agent "OpenCode-User/1.0" \
             --language "es-ES,es;q=0.9" \
             --verbose \
             --file-log \
             --extra-log \
             --debug-log \
-            --debug-headers \
-            2>&1 | tee httrack-diagnostico.log
+            -#p \
+            "-*" \
+            "+developer.android.com/develop/ui*" \
+            "-developer.android.com/develop/ui*hl=*" \
+            "+developer.android.com/develop/ui*hl=es*" \
+            "+developer.android.com/static/*" \
+            "+www.gstatic.com/devrel-devsite/*" \
+            2>&1 | tee httrack-console.log
 
-      - name: Analizar resultado
+      - name: Analizar archivos descargados
         if: always()
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          from collections import Counter
 
-          folder = Path("prueba-httrack")
+          folder = Path("android-ui-es")
+          report = Path("informe-recursos.txt")
+
+          extensions = [
+              ".html", ".htm", ".css", ".js",
+              ".png", ".jpg", ".jpeg", ".webp",
+              ".gif", ".svg", ".ico",
+              ".woff", ".woff2", ".ttf", ".otf",
+              ".json", ".xml", ".pdf"
+          ]
+
           files = [p for p in folder.rglob("*") if p.is_file()]
+          counts = Counter(p.suffix.lower() for p in files)
+          total_size = sum(p.stat().st_size for p in files)
 
-          total = sum(p.stat().st_size for p in files)
+          lines = [
+              "INFORME DE DESCARGA ANDROID UI",
+              "",
+              f"Total de archivos: {len(files)}",
+              f"Tamano total: {total_size / (1024 * 1024):.2f} MB",
+              "",
+              "RECURSOS POR EXTENSION:"
+          ]
 
-          print("RESULTADO DE LA PRUEBA")
-          print("Archivos encontrados:", len(files))
-          print(f"Tamano total: {total / 1024:.2f} KB")
+          for ext in extensions:
+              lines.append(f"{ext}: {counts[ext]}")
 
-          for p in files:
-              print(f"{p}: {p.stat().st_size} bytes")
+          lines.extend([
+              "",
+              "COMPROBACION:",
+              f"Carpeta principal: {folder.exists()}",
+              f"HTML: {counts['.html'] + counts['.htm']}",
+              f"CSS: {counts['.css']}",
+              f"JavaScript: {counts['.js']}"
+          ])
+
+          report.write_text("\n".join(lines), encoding="utf-8")
+          print("\n".join(lines))
           PY
 
-      - name: Guardar registros
+      - name: Guardar documentacion descargada
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: Diagnostico-HTTrack
+          name: Android-UI-Espanol
           path: |
-            prueba-httrack/
+            android-ui-es/
+            httrack-console.log
+            informe-recursos.txt
             pagina-prueba.html
-            httrack-diagnostico.log
           if-no-files-found: warn
           retention-days: 7
+          compression-level: 6
