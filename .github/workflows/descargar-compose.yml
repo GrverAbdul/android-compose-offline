@@ -1,5 +1,5 @@
 
-name: Descargar Android UI en espanol
+name: Descargar curso Jetpack Compose en espanol
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   descargar:
-    name: Descargar documentacion Android UI
+    name: Descargar curso Jetpack Compose
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -24,41 +24,40 @@ jobs:
       - name: Preparar carpetas
         shell: bash
         run: |
-          mkdir -p android-ui-es
+          mkdir -p jetpack-compose-curso
 
-      - name: Comprobar acceso a Android Developers
+      - name: Comprobar acceso al curso
         shell: bash
         run: |
-          URL="https://developer.android.com/develop/ui?hl=es"
-          USER_AGENT="OpenCode-User/1.0"
+          URL="https://developer.android.com/courses/jetpack-compose/course?hl=es"
 
-          echo "Comprobando acceso a la pagina..."
+          echo "Comprobando acceso al curso..."
 
           curl -sS -L \
             --max-redirs 10 \
-            -A "$USER_AGENT" \
+            -A "OpenCode-User/1.0" \
             -o pagina-prueba.html \
             -w "\nHTTP final: %{http_code}\nURL final: %{url_effective}\nTipo de contenido: %{content_type}\n" \
             "$URL"
-
-          if grep -qiE 'oauth2callback|accounts\.google\.com' pagina-prueba.html; then
-            echo "ERROR: Redireccion a Google OAuth."
-            exit 1
-          fi
 
           if ! grep -qiE '<html|<!doctype html' pagina-prueba.html; then
             echo "ERROR: No se recibio HTML."
             exit 1
           fi
 
-          echo "Acceso correcto."
+          if grep -qiE 'oauth2callback|accounts\.google\.com' pagina-prueba.html; then
+            echo "ERROR: Redireccion a Google OAuth."
+            exit 1
+          fi
 
-      - name: Descargar documentacion con HTTrack
+          echo "Acceso correcto al curso."
+
+      - name: Descargar curso con HTTrack
         shell: bash
         timeout-minutes: 330
         run: |
-          URL="https://developer.android.com/develop/ui?hl=es"
-          OUTPUT="android-ui-es"
+          URL="https://developer.android.com/courses/jetpack-compose/course?hl=es"
+          OUTPUT="jetpack-compose-curso"
 
           set -o pipefail
 
@@ -71,12 +70,16 @@ jobs:
             --verbose \
             --file-log \
             --extra-log \
-            --debug-log \
-            -#p \
+            -r5 \
             "-*" \
-            "+developer.android.com/develop/ui*" \
-            "-developer.android.com/develop/ui*hl=*" \
-            "+developer.android.com/develop/ui*hl=es*" \
+            "+developer.android.com/courses/jetpack-compose/*" \
+            "-developer.android.com/courses/jetpack-compose/*hl=*" \
+            "+developer.android.com/courses/jetpack-compose/*hl=es*" \
+            "+developer.android.com/courses/pathways/jetpack-compose-for-android-developers-*" \
+            "-developer.android.com/courses/pathways/jetpack-compose-for-android-developers-*hl=*" \
+            "+developer.android.com/courses/pathways/jetpack-compose-for-android-developers-*hl=es*" \
+            "+developer.android.com/codelabs/*" \
+            "+developer.android.com/develop/ui/compose/*" \
             "+developer.android.com/static/*" \
             "+www.gstatic.com/devrel-devsite/*" \
             2>&1 | tee httrack-console.log
@@ -89,7 +92,7 @@ jobs:
           from pathlib import Path
           from collections import Counter
 
-          folder = Path("android-ui-es")
+          folder = Path("jetpack-compose-curso")
           report = Path("informe-recursos.txt")
 
           extensions = [
@@ -97,7 +100,8 @@ jobs:
               ".png", ".jpg", ".jpeg", ".webp",
               ".gif", ".svg", ".ico",
               ".woff", ".woff2", ".ttf", ".otf",
-              ".json", ".xml", ".pdf"
+              ".json", ".xml", ".pdf",
+              ".mp4", ".webm"
           ]
 
           files = [p for p in folder.rglob("*") if p.is_file()]
@@ -105,7 +109,7 @@ jobs:
           total_size = sum(p.stat().st_size for p in files)
 
           lines = [
-              "INFORME DE DESCARGA ANDROID UI",
+              "INFORME DE DESCARGA JETPACK COMPOSE",
               "",
               f"Total de archivos: {len(files)}",
               f"Tamano total: {total_size / (1024 * 1024):.2f} MB",
@@ -116,7 +120,9 @@ jobs:
           for ext in extensions:
               lines.append(f"{ext}: {counts[ext]}")
 
+          known = sum(counts[ext] for ext in extensions)
           lines.extend([
+              f"Sin extension u otros formatos: {len(files) - known}",
               "",
               "COMPROBACION:",
               f"Carpeta principal: {folder.exists()}",
@@ -129,13 +135,13 @@ jobs:
           print("\n".join(lines))
           PY
 
-      - name: Guardar documentacion descargada
+      - name: Guardar curso descargado
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: Android-UI-Espanol
+          name: Jetpack-Compose-Desarrolladores-Espanol
           path: |
-            android-ui-es/
+            jetpack-compose-curso/
             httrack-console.log
             informe-recursos.txt
             pagina-prueba.html
