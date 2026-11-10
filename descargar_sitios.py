@@ -13,6 +13,8 @@ SITES = [
         "name": "WebCode",
         "start": "https://webcode.net.pe/web/index.html",
         "hosts": {"webcode.net.pe"},
+        # Recursos externos usados por WebCode (Bootstrap y Bootstrap Icons).
+        "resource_hosts": {"cdn.jsdelivr.net"},
     },
     {
         "name": "Cursos Pensa",
@@ -100,6 +102,17 @@ def clean_url(url):
 def is_internal(url, site):
     try:
         return urlsplit(url).hostname in site["hosts"]
+    except Exception:
+        return False
+
+def is_allowed_resource(url, site):
+    """Permite recursos de los dominios del sitio y CDNs expresamente autorizados."""
+    try:
+        host = urlsplit(url).hostname
+        return (
+            host in site["hosts"]
+            or host in site.get("resource_hosts", set())
+        )
     except Exception:
         return False
 def query_suffix(query):
@@ -343,7 +356,7 @@ def save_response_resource(response, site):
         if response.status not in (200, 206):
             return
         url = clean_url(response.url)
-        if not url or not is_internal(url, site):
+        if not url or not is_allowed_resource(url, site):
             return
         allowed = {
             "stylesheet", "script", "image",
