@@ -3,9 +3,16 @@ name: Descargar documentacion offline con Chromium
 
 on:
   workflow_dispatch:
+    inputs:
+      restore_run_id:
+        description: "ID de la ejecucion anterior que contiene la descarga"
+        required: false
+        default: "42815139760"
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   descargar:
@@ -16,18 +23,43 @@ jobs:
       - name: Obtener el repositorio
         uses: actions/checkout@v4
 
+      - name: Recuperar descarga anterior
+        if: ${{ inputs.restore_run_id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: Documentacion-WebCode-Pensa-JavierCarrasco
+          run-id: ${{ inputs.restore_run_id }}
+          github-token: ${{ github.token }}
+          path: .
+
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Instalar Playwright y Chromium
+      - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
-          pip install playwright beautifulsoup4
+          pip install playwright beautifulsoup4 aiohttp
+
+      - name: Instalar Chromium
+        run: |
           python -m playwright install --with-deps chromium
 
-      - name: Descargar los tres sitios
+      - name: Comprobar recuperacion anterior
+        run: |
+          echo "Comprobando archivos recuperados..."
+
+          if [ -d "salida" ]; then
+            echo "Carpeta salida encontrada."
+            find salida -type f | wc -l
+          else
+            echo "No se recupero una carpeta anterior."
+            mkdir -p salida
+          fi
+
+      - name: Descargar y completar los tres sitios
         timeout-minutes: 330
         run: python descargar_sitios.py
 
@@ -40,6 +72,7 @@ jobs:
             salida/
             informe-descarga.json
             errores-descarga.txt
+            descargas-fallidas.txt
           if-no-files-found: warn
           retention-days: 7
           compression-level: 6
