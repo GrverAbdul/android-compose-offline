@@ -1,27 +1,20 @@
 
-import asyncio
-import hashlib
-import json
 import os
 import re
-import traceback
-import xml.etree.ElementTree as ET
-
-from collections import deque
+import json
+import time
+import hashlib
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, urldefrag, unquote
+from collections import deque
+from urllib.parse import urljoin, urlsplit, urlunsplit, unquote, quote
 
-import aiohttp
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 # ============================================================
-# CONFIGURACION GENERAL
+# CONFIGURACION
 # ============================================================
-
-ROOT = Path("salida")
-ROOT.mkdir(parents=True, exist_ok=True)
 
 SITES = [
     {
@@ -30,1274 +23,831 @@ SITES = [
         "hosts": {"webcode.net.pe"},
     },
     {
-        "name": "Cursos-Pensa",
+        "name": "Cursos Pensa",
         "start": "https://cursospensa.ar/",
         "hosts": {"cursospensa.ar", "www.cursospensa.ar"},
     },
     {
-        "name": "Javier-Carrasco",
+        "name": "Javier Carrasco",
         "start": "https://documentation.javiercarrasco.es/",
         "hosts": {"documentation.javiercarrasco.es"},
     },
 ]
 
-MAX_PAGES_PER_SITE = 7500
+ROOT = Path("salida")
+METADATA = ROOT / "_metadata"
+
+URL_MAP_FILE = METADATA / "url-map.json"
+PAGE_MAP_FILE = METADATA / "page-map.json"
+
+MAX_PAGES_PER_SITE = 2500
 MAX_DEPTH = 25
-NAV_TIMEOUT_MS = 45000
-WAIT_AFTER_LOAD_MS = 700
 
-MAX_CAPTURE_BYTES = 25 * 1024 * 1024
-MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
-DOWNLOAD_CONCURRENCY = 3
+NAVIGATION_TIMEOUT = 45000
+WAIT_AFTER_LOAD_MS = 1200
+MAX_RESOURCE_SIZE = 100 * 1024 * 1024
 
-VIDEO_EXTENSIONS = {
-    ".mp4", ".webm", ".mov", ".m4v", ".ogv", ".mpg", ".mpeg"
-}
+IGNORED_SCHEMES = (
+    "mailto:", "tel:", "javascript:", "data:",
+    "blob:", "intent:", "about:"
+)
 
-DOCUMENT_EXTENSIONS = {
-    ".pdf", ".sql", ".zip", ".rar", ".7z",
-    ".doc", ".docx", ".xls", ".xlsx",
-    ".ppt", ".pptx", ".txt", ".csv",
-    ".apk", ".aab", ".json", ".xml"
-}
-
-STATIC_EXTENSIONS = {
-    ".css", ".js", ".mjs", ".png", ".jpg", ".jpeg",
-    ".gif", ".webp", ".svg", ".ico",
+NON_PAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+    ".css", ".js", ".mjs", ".json", ".xml", ".txt",
+    ".pdf", ".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg",
+    ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".sql", ".db", ".apk", ".exe", ".msi",
     ".woff", ".woff2", ".ttf", ".otf", ".eot",
-    ".mp3", ".wav", ".ogg", ".aac",
-    ".mp4", ".webm", ".mov", ".m4v", ".ogv",
-    ".pdf", ".sql", ".zip", ".rar", ".7z",
-    ".doc", ".docx", ".xls", ".xlsx",
-    ".ppt", ".pptx", ".txt", ".csv",
-    ".apk", ".aab"
+    ".bin", ".webmanifest",
 }
 
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/130.0.0.0 Safari/537.36"
-    )
+HTML_MIME = {
+    "text/html",
+    "application/xhtml+xml",
 }
 
-url_to_file = {}
-source_url_by_file = {}
-
-download_urls = set()
-saved_assets = set()
-saved_documents = set()
-visited_pages = set()
-
-errors = []
-failed_downloads = []
-page_records = []
-
-html_count_by_site = {}
-document_count_by_site = {}
-asset_count_by_site = {}
+MIME_EXTENSIONS = {
+    "text/css": ".css",
+    "application/javascript": ".js",
+    "text/javascript": ".js",
+    "application/x-javascript": ".js",
+    "application/json": ".json",
+    "application/xml": ".xml",
+    "text/xml": ".xml",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/svg+xml": ".svg",
+    "image/x-icon": ".ico",
+    "font/woff": ".woff",
+    "font/woff2": ".woff2",
+    "application/font-woff": ".woff",
+    "application/font-woff2": ".woff2",
+    "application/pdf": ".pdf",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+}
 
 
 # ============================================================
-# UTILIDADES DE URL Y ARCHIVOS
+# ESTADO
+# ============================================================
+
+url_to_file = {}
+file_to_url = {}
+page_urls = set()
+asset_urls = set()
+errors = []
+visited_by_site = {}
+
+
+# ============================================================
+# UTILIDADES GENERALES
 # ============================================================
 
 def clean_url(url):
     if not url:
-        return None
+        return ""
 
-    url, _ = urldefrag(url)
-    p = urlparse(url)
-
-    if p.scheme not in ("http", "https") or not p.netloc:
-        return None
-
-    return url
-
-
-def extension_of(url):
-    return Path(unquote(urlparse(url).path)).suffix.lower()
-
-
-def is_internal(url, hosts):
     try:
-        return urlparse(url).hostname in hosts
+        parts = urlsplit(str(url).strip())
+
+        if parts.scheme.lower() not in ("http", "https"):
+            return ""
+
+        return urlunsplit((
+            parts.scheme.lower(),
+            parts.netloc.lower(),
+            parts.path or "/",
+            parts.query,
+            ""
+        ))
+    except Exception:
+        return ""
+
+
+def is_internal(url, site):
+    try:
+        return urlsplit(url).hostname in site["hosts"]
     except Exception:
         return False
 
 
-def is_video(url):
-    return extension_of(url) in VIDEO_EXTENSIONS
+def query_suffix(query):
+    if not query:
+        return ""
+
+    digest = hashlib.sha1(
+        query.encode("utf-8")
+    ).hexdigest()[:10]
+
+    return "__q_" + digest
 
 
-def is_document(url):
-    return extension_of(url) in DOCUMENT_EXTENSIONS
-
-
-def is_download(url):
-    return is_video(url) or is_document(url)
-
-
-def is_page_candidate(url):
-    ext = extension_of(url)
-
-    if ext in STATIC_EXTENSIONS:
+def looks_like_html(data):
+    if not data:
         return False
 
-    if ext and ext not in {
-        ".html", ".htm", ".php", ".asp", ".aspx"
-    }:
+    sample = data[:4096].lstrip().lower()
+
+    signatures = (
+        b"<!doctype html",
+        b"<html",
+        b"<head",
+        b"<body",
+        b"<title",
+        b"<meta",
+        b"<?xml",
+    )
+
+    return any(sample.startswith(x) for x in signatures)
+
+
+def looks_like_css(data):
+    if not data:
         return False
 
-    return True
+    sample = data[:2048].lstrip().lower()
+
+    return (
+        b"{" in sample
+        and (
+            b"body" in sample
+            or b"html" in sample
+            or b"@" in sample
+            or b":" in sample
+        )
+    )
 
 
-def local_path_for(url, default_ext=".bin"):
+def detect_extension(url, content_type, data):
+    """
+    Detecta el formato real del archivo.
+    No depende únicamente de la extensión de la URL.
+    """
+
+    mime = (
+        content_type or ""
+    ).split(";")[0].strip().lower()
+
+    path_ext = Path(
+        urlsplit(url).path
+    ).suffix.lower()
+
+    if looks_like_html(data):
+        return ".html"
+
+    if data.startswith(b"%PDF-"):
+        return ".pdf"
+
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+
+    if data.startswith(b"PK\x03\x04"):
+        return path_ext if path_ext in (
+            ".zip", ".docx", ".xlsx", ".pptx", ".apk"
+        ) else ".zip"
+
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return ".mp4"
+
+    if data.startswith(b"wOFF"):
+        return ".woff"
+
+    if data.startswith(b"wOF2"):
+        return ".woff2"
+
+    if data.startswith(b"\x00\x01\x00\x00"):
+        return ".ttf"
+
+    if mime in MIME_EXTENSIONS:
+        return MIME_EXTENSIONS[mime]
+
+    if mime == "text/css" or looks_like_css(data):
+        return ".css"
+
+    if path_ext:
+        return path_ext
+
+    return ".bin"
+
+
+def safe_local_path(url, force_html=False, content_type=None):
+    parts = urlsplit(url)
+
+    host = parts.hostname or "desconocido"
+    web_path = unquote(parts.path or "/")
+
+    if web_path.endswith("/"):
+        web_path += "index"
+
+    relative = Path(host) / web_path.lstrip("/")
+
+    mime = (
+        content_type or ""
+    ).split(";")[0].strip().lower()
+
+    suffix = relative.suffix.lower()
+
+    if force_html or mime in HTML_MIME:
+        if suffix in (
+            "", ".bin", ".php", ".asp",
+            ".aspx", ".jsp"
+        ):
+            relative = relative.with_suffix(".html")
+
+    elif not suffix:
+        extension = MIME_EXTENSIONS.get(mime, ".bin")
+        relative = relative.with_suffix(extension)
+
+    if parts.query:
+        relative = relative.with_name(
+            relative.stem
+            + query_suffix(parts.query)
+            + relative.suffix
+        )
+
+    return ROOT / relative
+
+
+def write_file(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def register_url(url, path, is_page=False):
     url = clean_url(url)
 
     if not url:
-        return None
+        return
 
-    if url in url_to_file:
-        return url_to_file[url]
+    path = Path(path)
 
-    p = urlparse(url)
+    url_to_file[url] = path
+    file_to_url[str(path)] = url
 
-    host = (p.netloc or "unknown").lower().replace(":", "_")
-    raw_path = unquote(p.path or "/")
+    if is_page:
+        page_urls.add(url)
 
-    parts = [
-        part for part in raw_path.split("/")
-        if part not in ("", ".", "..")
-    ]
 
-    safe_parts = []
+def save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    for part in parts:
-        part = re.sub(r"[^A-Za-z0-9._@() -]", "_", part)
-        part = part[:120]
-        safe_parts.append(part or "_")
-
-    if not safe_parts:
-        safe_parts = ["index" + default_ext]
-
-    elif raw_path.endswith("/"):
-        safe_parts.append("index" + default_ext)
-
-    elif "." not in safe_parts[-1]:
-        safe_parts[-1] += default_ext
-
-    path = Path(host, *safe_parts)
-
-    if p.query:
-        digest = hashlib.sha1(
-            p.query.encode("utf-8")
-        ).hexdigest()[:10]
-
-        path = path.with_name(
-            path.stem + "__q_" + digest + path.suffix
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(
+            data,
+            file,
+            ensure_ascii=False,
+            indent=2
         )
 
-    full_path = ROOT / path
-
-    url_to_file[url] = full_path
-    return full_path
-
-
-def relative_target(source_file, target_file):
-    return os.path.relpath(
-        target_file,
-        start=source_file.parent
-    ).replace(os.sep, "/")
-
-
-def safe_write(path, body):
-    if not path or not body:
-        return False
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(body)
-    return True
-
-
-def is_valid_mp4(path):
-    try:
-        if not path.exists() or path.stat().st_size < 12:
-            return False
-
-        with path.open("rb") as f:
-            header = f.read(64)
-
-        return b"ftyp" in header[:32]
-
-    except Exception:
-        return False
-
 
 # ============================================================
-# DESCUBRIMIENTO DE SITEMAPS
+# RECUPERAR MAPAS ANTERIORES
 # ============================================================
 
-async def discover_sitemaps(session, site):
-    hosts = site["hosts"]
-    base = site["start"]
-
-    sitemap_queue = deque([
-        urljoin(base, "robots.txt"),
-        urljoin(base, "sitemap.xml"),
-    ])
-
-    visited_sitemaps = set()
-    discovered = set()
-
-    while sitemap_queue and len(visited_sitemaps) < 15:
-        sitemap_url = sitemap_queue.popleft()
-
-        if sitemap_url in visited_sitemaps:
-            continue
-
-        visited_sitemaps.add(sitemap_url)
-
+def load_previous_maps():
+    if URL_MAP_FILE.exists():
         try:
-            async with session.get(
-                sitemap_url,
-                timeout=aiohttp.ClientTimeout(total=35)
-            ) as response:
-
-                if response.status != 200:
-                    continue
-
-                text = await response.text(errors="replace")
-
-            if sitemap_url.endswith("robots.txt"):
-                for line in text.splitlines():
-                    if line.lower().startswith("sitemap:"):
-                        candidate = line.split(":", 1)[1].strip()
-
-                        if candidate:
-                            sitemap_queue.append(candidate)
-
-                continue
-
-            try:
-                root = ET.fromstring(text)
-            except Exception:
-                continue
-
-            for element in root.iter():
-                if not element.tag.lower().endswith("loc"):
-                    continue
-
-                value = (element.text or "").strip()
-                value = clean_url(value)
-
-                if not value or not is_internal(value, hosts):
-                    continue
-
-                if value.endswith(".xml"):
-                    sitemap_queue.append(value)
-
-                elif is_download(value):
-                    download_urls.add(value)
-
-                elif is_page_candidate(value):
-                    discovered.add(value)
-
-        except Exception as e:
-            errors.append(
-                f"[sitemap] {sitemap_url}: {e}"
+            data = json.loads(
+                URL_MAP_FILE.read_text(encoding="utf-8")
             )
 
-    return discovered
+            for url, relative in data.items():
+                path = ROOT / relative
+
+                if path.exists():
+                    register_url(url, path)
+
+            print(
+                "URLs recuperadas del mapa anterior:",
+                len(url_to_file)
+            )
+
+        except Exception as exc:
+            print("Error recuperando mapa anterior:", exc)
+
+    if PAGE_MAP_FILE.exists():
+        try:
+            data = json.loads(
+                PAGE_MAP_FILE.read_text(encoding="utf-8")
+            )
+
+            for url in data:
+                page_urls.add(clean_url(url))
+
+        except Exception as exc:
+            print("Error recuperando mapa de páginas:", exc)
 
 
 # ============================================================
-# CAPTURA DE RESPUESTAS DEL NAVEGADOR
+# RECUPERAR HTML ANTIGUO GUARDADO COMO BIN
 # ============================================================
 
-async def capture_response(response, site_name):
+def infer_old_pages():
+    """
+    Recupera archivos .bin cuyo contenido realmente es HTML.
+    Después reconstruye las direcciones de páginas antiguas.
+    """
+
+    if not ROOT.exists():
+        return
+
+    known_hosts = set()
+
+    for site in SITES:
+        known_hosts.update(site["hosts"])
+
+    # Convertir .bin que realmente contienen HTML.
+    for old_file in list(ROOT.rglob("*.bin")):
+        if "_metadata" in old_file.parts:
+            continue
+
+        try:
+            data = old_file.read_bytes()
+
+            if not looks_like_html(data):
+                continue
+
+            new_file = old_file.with_suffix(".html")
+
+            if new_file.exists():
+                continue
+
+            old_file.rename(new_file)
+
+            print(
+                "HTML recuperado:",
+                old_file,
+                "->",
+                new_file
+            )
+
+        except Exception as exc:
+            errors.append(
+                f"RECUPERAR BIN | {old_file} | {exc}"
+            )
+
+    # Reconstruir URL original a partir de la ubicación.
+    for html_file in ROOT.rglob("*.html"):
+        if "_metadata" in html_file.parts:
+            continue
+
+        try:
+            relative = html_file.relative_to(ROOT)
+        except ValueError:
+            continue
+
+        if len(relative.parts) < 2:
+            continue
+
+        host = relative.parts[0]
+
+        if host not in known_hosts:
+            continue
+
+        web_path = "/" + "/".join(relative.parts[1:])
+
+        if web_path.lower() == "/index.html":
+            register_url(
+                "https://" + host + "/",
+                html_file,
+                is_page=True
+            )
+
+            register_url(
+                "https://" + host + "/index.html",
+                html_file,
+                is_page=True
+            )
+
+        elif web_path.lower().endswith("/index.html"):
+            directory = web_path[:-10]
+
+            if not directory.endswith("/"):
+                directory += "/"
+
+            register_url(
+                "https://" + host + directory,
+                html_file,
+                is_page=True
+            )
+
+            register_url(
+                "https://" + host + web_path,
+                html_file,
+                is_page=True
+            )
+
+        else:
+            inferred_path = (
+                web_path[:-5]
+                if web_path.lower().endswith(".html")
+                else web_path
+            )
+
+            register_url(
+                "https://" + host + inferred_path,
+                html_file,
+                is_page=True
+            )
+
+            register_url(
+                "https://" + host + inferred_path + ".html",
+                html_file,
+                is_page=True
+            )
+
+
+# ============================================================
+# CAPTURA DE RECURSOS DEL NAVEGADOR
+# ============================================================
+
+def save_response_resource(response, site):
     try:
-        request = response.request
-        resource_type = request.resource_type
+        resource_type = response.request.resource_type
 
-        status = response.status
+        if resource_type in ("document", "websocket"):
+            return
 
-        if status not in (200, 206):
+        if response.status not in (200, 206):
             return
 
         url = clean_url(response.url)
 
-        if not url:
+        if not url or not is_internal(url, site):
             return
 
-        if is_video(url):
-            download_urls.add(url)
-            return
-
-        if is_document(url):
-            download_urls.add(url)
-            return
-
-        if resource_type == "document":
-            return
-
-        allowed_types = {
-            "stylesheet",
-            "script",
-            "image",
-            "font",
-            "manifest",
-            "xhr",
-            "fetch",
+        allowed = {
+            "stylesheet", "script", "image",
+            "font", "manifest", "media"
         }
 
-        if resource_type not in allowed_types:
+        if resource_type not in allowed:
             return
 
-        headers = await response.all_headers()
+        headers = response.headers
+        content_type = headers.get("content-type", "")
 
-        content_type = headers.get(
-            "content-type", ""
-        ).lower()
+        length = headers.get("content-length")
 
-        if "text/html" in content_type:
-            return
-
-        content_length = headers.get("content-length")
-
-        if content_length:
+        if length:
             try:
-                if int(content_length) > MAX_CAPTURE_BYTES:
+                if int(length) > MAX_RESOURCE_SIZE:
+                    print("Recurso demasiado grande:", url)
                     return
-            except Exception:
+            except ValueError:
                 pass
 
-        body = await response.body()
+        data = response.body()
 
-        if not body:
+        if not data or len(data) > MAX_RESOURCE_SIZE:
             return
 
-        if len(body) > MAX_CAPTURE_BYTES:
+        # Evitar guardar una página HTML como imagen, fuente o binario.
+        if looks_like_html(data):
             return
 
-        default_ext = ".bin"
-
-        if resource_type == "stylesheet":
-            default_ext = ".css"
-        elif resource_type == "script":
-            default_ext = ".js"
-
-        path = local_path_for(
+        extension = detect_extension(
             url,
-            default_ext=default_ext
+            content_type,
+            data
         )
 
-        if safe_write(path, body):
-            saved_assets.add(url)
-            asset_count_by_site[site_name] = (
-                asset_count_by_site.get(site_name, 0) + 1
-            )
+        path = safe_local_path(
+            url,
+            content_type=content_type
+        )
 
-    except Exception as e:
+        if path.suffix.lower() != extension:
+            path = path.with_suffix(extension)
+
+        write_file(path, data)
+        register_url(url, path)
+
+        asset_urls.add(url)
+
+    except Exception as exc:
         errors.append(
-            f"[recurso navegador] {response.url}: {e}"
+            f"RECURSO | {response.url} | {exc}"
         )
 
 
 # ============================================================
-# DESCARGA DIRECTA DE VIDEOS Y DOCUMENTOS
+# EXTRACCIÓN DE ENLACES
 # ============================================================
 
-async def download_file(session, url, semaphore):
-    async with semaphore:
-        url = clean_url(url)
+def extract_page_links(page, current_url, site):
+    results = []
 
-        if not url:
-            return
+    try:
+        elements = page.locator(
+            "a[href], area[href], iframe[src], "
+            "frame[src], source[src], video[src], "
+            "audio[src], link[href]"
+        ).evaluate_all("""
+            elements => elements.map(el => ({
+                href: el.href || el.getAttribute('href') || '',
+                src: el.src || el.getAttribute('src') || ''
+            }))
+        """)
 
-        path = local_path_for(url)
+        for item in elements:
+            value = item.get("href") or item.get("src")
 
-        if not path:
-            return
+            if not value:
+                continue
 
-        # Conservar archivos anteriores si son válidos.
-        if path.exists() and path.stat().st_size > 0:
-            if not is_video(url) or is_valid_mp4(path):
-                return
+            value = value.strip()
 
-        temp_path = path.with_suffix(
-            path.suffix + ".part"
+            if value.startswith(IGNORED_SCHEMES):
+                continue
+
+            absolute = clean_url(
+                urljoin(current_url, value)
+            )
+
+            if not absolute:
+                continue
+
+            if not is_internal(absolute, site):
+                continue
+
+            results.append(absolute)
+
+    except Exception as exc:
+        errors.append(
+            f"EXTRACCION ENLACES | {current_url} | {exc}"
         )
 
-        headers = dict(BROWSER_HEADERS)
-        headers["Referer"] = (
-            urlparse(url).scheme + "://" +
-            urlparse(url).netloc + "/"
-        )
+    return list(dict.fromkeys(results))
 
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
 
-            total = 0
-            first_bytes = b""
+def is_probable_page(url):
+    extension = Path(
+        urlsplit(url).path
+    ).suffix.lower()
 
-            async with session.get(
-                url,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(
-                    total=None,
-                    sock_connect=30,
-                    sock_read=120
-                ),
-                allow_redirects=True
-            ) as response:
-
-                if response.status not in (200, 206):
-                    raise Exception(
-                        f"HTTP {response.status}"
-                    )
-
-                content_type = response.headers.get(
-                    "Content-Type", ""
-                ).lower()
-
-                if is_video(url) and "text/html" in content_type:
-                    raise Exception(
-                        "El servidor devolvió HTML en lugar de vídeo"
-                    )
-
-                with temp_path.open("wb") as output:
-                    async for chunk in response.content.iter_chunked(
-                        1024 * 256
-                    ):
-                        if not chunk:
-                            continue
-
-                        total += len(chunk)
-
-                        if total > MAX_DOWNLOAD_BYTES:
-                            raise Exception(
-                                "Archivo supera el límite de 1 GB"
-                            )
-
-                        if len(first_bytes) < 64:
-                            needed = 64 - len(first_bytes)
-                            first_bytes += chunk[:needed]
-
-                        output.write(chunk)
-
-            if total == 0:
-                raise Exception("Archivo vacío")
-
-            if is_video(url) and b"ftyp" not in first_bytes[:32]:
-                raise Exception(
-                    "El contenido descargado no tiene firma MP4 válida"
-                )
-
-            temp_path.replace(path)
-
-            saved_documents.add(url)
-
-            site_host = urlparse(url).hostname
-
-            document_count_by_site[site_host] = (
-                document_count_by_site.get(site_host, 0) + 1
-            )
-
-            print(
-                f"[DESCARGADO] {url} ({total / 1024:.1f} KB)",
-                flush=True
-            )
-
-        except Exception as e:
-            try:
-                if temp_path.exists():
-                    temp_path.unlink()
-            except Exception:
-                pass
-
-            failed_downloads.append(
-                f"{url} -> {e}"
-            )
+    return extension not in NON_PAGE_EXTENSIONS
 
 
 # ============================================================
-# CRAWLER PRINCIPAL
+# DESCARGA DE PAGINAS
 # ============================================================
 
-async def crawl_site(browser, session, site):
-    name = site["name"]
-    hosts = site["hosts"]
+def crawl_site(browser, site):
+    print("\n" + "=" * 65)
+    print("SITIO:", site["name"])
+    print("INICIO:", site["start"])
+    print("=" * 65)
 
-    queue = deque([(site["start"], 0)])
-    site_seen = set()
-
-    sitemap_urls = await discover_sitemaps(
-        session,
-        site
+    context = browser.new_context(
+        ignore_https_errors=True,
+        viewport={
+            "width": 1440,
+            "height": 1000
+        },
+        locale="es-ES",
     )
 
-    for url in sitemap_urls:
-        queue.append((url, 0))
-
-    print(
-        f"\n===== INICIANDO {name} =====",
-        flush=True
+    context.set_default_navigation_timeout(
+        NAVIGATION_TIMEOUT
     )
 
-    while queue and len(site_seen) < MAX_PAGES_PER_SITE:
-        current, depth = queue.popleft()
+    context.set_default_timeout(15000)
 
-        current = clean_url(current)
+    context.on(
+        "response",
+        lambda response: save_response_resource(
+            response,
+            site
+        )
+    )
 
-        if not current:
+    start = clean_url(site["start"])
+
+    queue = deque([(start, 0)])
+    queued = {start}
+    visited = set()
+
+    pages_saved = 0
+
+    while queue and pages_saved < MAX_PAGES_PER_SITE:
+        current_url, depth = queue.popleft()
+
+        current_url = clean_url(current_url)
+
+        if not current_url or current_url in visited:
             continue
 
-        if current in site_seen or depth > MAX_DEPTH:
+        if depth > MAX_DEPTH:
             continue
 
-        if not is_internal(current, hosts):
+        if not is_internal(current_url, site):
             continue
 
-        if is_download(current):
-            download_urls.add(current)
+        if not is_probable_page(current_url):
             continue
 
-        if not is_page_candidate(current):
-            continue
+        visited.add(current_url)
 
-        site_seen.add(current)
-        visited_pages.add(current)
-
-        page = await browser.new_page()
-
-        response_tasks = set()
-
-        def schedule_capture(response):
-            task = asyncio.create_task(
-                capture_response(response, name)
-            )
-
-            response_tasks.add(task)
-            task.add_done_callback(response_tasks.discard)
-
-        page.on("response", schedule_capture)
+        page = context.new_page()
 
         try:
             print(
-                f"[{name}] ({len(site_seen)}/{MAX_PAGES_PER_SITE}) {current}",
-                flush=True
+                f"[{site['name']}] "
+                f"({pages_saved + 1}/{MAX_PAGES_PER_SITE}) "
+                f"{current_url}"
             )
 
-            response = None
-
-            try:
-                response = await page.goto(
-                    current,
-                    wait_until="domcontentloaded",
-                    timeout=NAV_TIMEOUT_MS
-                )
-            except PlaywrightTimeoutError:
-                errors.append(
-                    f"[timeout navegación] {current}"
-                )
-            except Exception as e:
-                errors.append(
-                    f"[navegación] {current}: {e}"
-                )
+            response = page.goto(
+                current_url,
+                wait_until="domcontentloaded",
+                timeout=NAVIGATION_TIMEOUT
+            )
 
             if response is None:
                 continue
 
-            status = response.status
-
-            if status not in (200, 206):
+            if response.status >= 400:
                 errors.append(
-                    f"[HTTP {status}] {current}"
+                    f"HTTP {response.status} | {current_url}"
                 )
                 continue
 
-            headers = await response.all_headers()
-
-            content_type = headers.get(
-                "content-type", ""
-            ).lower()
-
-            final_url = clean_url(page.url) or current
-
-            if not is_internal(final_url, hosts):
-                continue
-
-            # Nunca guardar el reproductor HTML como un vídeo.
-            if is_download(final_url) or is_download(current):
-                download_urls.add(current)
-                download_urls.add(final_url)
-                continue
-
-            if "text/html" not in content_type:
-                try:
-                    body = await response.body()
-                    path = local_path_for(
-                        final_url,
-                        default_ext=".bin"
-                    )
-
-                    if body:
-                        safe_write(path, body)
-                        saved_documents.add(final_url)
-
-                except Exception as e:
-                    errors.append(
-                        f"[documento navegación] {current}: {e}"
-                    )
-
-                continue
-
-            # Cargar imágenes diferidas y contenido inferior.
             try:
-                await page.evaluate("""
+                page.wait_for_load_state(
+                    "networkidle",
+                    timeout=10000
+                )
+            except PlaywrightTimeoutError:
+                pass
+
+            page.wait_for_timeout(
+                WAIT_AFTER_LOAD_MS
+            )
+
+            # Activar imágenes diferidas.
+            try:
+                page.evaluate("""
                     () => {
-                        document.querySelectorAll('img[loading="lazy"]')
-                            .forEach(img => img.loading = 'eager');
-
-                        document.querySelectorAll('iframe[loading="lazy"]')
-                            .forEach(frame => frame.loading = 'eager');
-
-                        window.scrollTo(0, document.body.scrollHeight);
-                        window.scrollTo(0, 0);
+                        document.querySelectorAll(
+                            'img[loading="lazy"]'
+                        ).forEach(img => {
+                            img.loading = 'eager';
+                        });
                     }
                 """)
             except Exception:
                 pass
 
-            await page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
-
-            # Abrir elementos details, sin pulsar indiscriminadamente
-            # todos los botones de la página.
+            # Expandir elementos details.
             try:
-                details = page.locator(
-                    "details:not([open]) > summary"
-                )
-
-                count = min(await details.count(), 30)
-
-                for i in range(count):
-                    try:
-                        await details.nth(i).click(
-                            timeout=500,
-                            no_wait_after=True
-                        )
-                    except Exception:
-                        pass
-
+                page.locator("details").evaluate_all("""
+                    elements => elements.forEach(
+                        el => el.open = true
+                    )
+                """)
             except Exception:
                 pass
 
-            await page.wait_for_timeout(250)
+            final_url = clean_url(page.url) or current_url
 
-            html = await page.content()
-
-            if not html:
-                continue
-
-            final_file = local_path_for(final_url)
-
-            if not final_file:
-                continue
-
-            final_file.parent.mkdir(
-                parents=True,
-                exist_ok=True
-            )
-
-            final_file.write_text(
-                html,
-                encoding="utf-8",
+            html = page.content()
+            html_bytes = html.encode(
+                "utf-8",
                 errors="replace"
             )
 
-            url_to_file[current] = final_file
-            url_to_file[final_url] = final_file
+            if not looks_like_html(html_bytes):
+                errors.append(
+                    f"NO HTML | {current_url}"
+                )
+                continue
 
-            source_url_by_file[str(final_file)] = final_url
-
-            html_count_by_site[name] = (
-                html_count_by_site.get(name, 0) + 1
+            local_file = safe_local_path(
+                final_url,
+                force_html=True,
+                content_type="text/html"
             )
 
-            page_records.append({
-                "site": name,
-                "url": final_url,
-                "depth": depth,
-                "file": str(final_file),
-                "title": await page.title(),
-            })
+            write_file(local_file, html_bytes)
 
-            # Descubrir enlaces y recursos presentes en el DOM.
-            links = await page.evaluate("""
-                () => {
-                    const result = [];
+            register_url(
+                current_url,
+                local_file,
+                is_page=True
+            )
 
-                    const selectors = [
-                        'a[href]',
-                        'area[href]',
-                        'iframe[src]',
-                        'frame[src]',
-                        'img[src]',
-                        'img[data-src]',
-                        'img[data-lazy-src]',
-                        'source[src]',
-                        'video[src]',
-                        'video[poster]',
-                        'audio[src]',
-                        'script[src]',
-                        'link[href]',
-                        'object[data]',
-                        'embed[src]'
-                    ];
+            register_url(
+                final_url,
+                local_file,
+                is_page=True
+            )
 
-                    for (const selector of selectors) {
-                        for (const el of document.querySelectorAll(selector)) {
-                            for (const attr of [
-                                'href', 'src', 'data-src',
-                                'data-lazy-src', 'poster',
-                                'data', 'data-original'
-                            ]) {
-                                const value = el.getAttribute(attr);
+            pages_saved += 1
 
-                                if (value) {
-                                    try {
-                                        result.push(
-                                            new URL(value, document.baseURI).href
-                                        );
-                                    } catch (_) {}
-                                }
-                            }
-                        }
-                    }
-
-                    for (const el of document.querySelectorAll('[srcset]')) {
-                        const value = el.getAttribute('srcset') || '';
-
-                        for (const item of value.split(',')) {
-                            const url = item.trim().split(/\\s+/)[0];
-
-                            if (url) {
-                                try {
-                                    result.push(
-                                        new URL(url, document.baseURI).href
-                                    );
-                                } catch (_) {}
-                            }
-                        }
-                    }
-
-                    return [...new Set(result)];
-                }
-            """)
+            links = extract_page_links(
+                page,
+                final_url,
+                site
+            )
 
             for link in links:
-                link = clean_url(link)
-
-                if not link or not is_internal(link, hosts):
+                if link in queued or link in visited:
                     continue
 
-                if is_download(link):
-                    download_urls.add(link)
+                if is_probable_page(link):
+                    queue.append(
+                        (link, depth + 1)
+                    )
+                    queued.add(link)
 
-                elif is_page_candidate(link):
-                    if link not in site_seen:
-                        queue.append((link, depth + 1))
-
-        except Exception as e:
+        except PlaywrightTimeoutError:
             errors.append(
-                f"[página] {current}: {e}"
+                f"TIMEOUT | {current_url}"
             )
-            errors.append(traceback.format_exc())
+
+        except Exception as exc:
+            errors.append(
+                f"PAGINA | {current_url} | {exc}"
+            )
 
         finally:
-            if response_tasks:
-                await asyncio.gather(
-                    *list(response_tasks),
-                    return_exceptions=True
-                )
-
-            await page.close()
-
-    if queue:
-        errors.append(
-            f"[límite] {name}: quedaron {len(queue)} URLs pendientes."
-        )
-
-    print(
-        f"===== FINALIZADO {name}: "
-        f"{len(site_seen)} URLs de página procesadas =====",
-        flush=True
-    )
-
-
-# ============================================================
-# REESCRITURA DE HTML PARA NAVEGACION OFFLINE
-# ============================================================
-
-def rewrite_html():
-    for html_file in ROOT.rglob("*.html"):
-        source_url = source_url_by_file.get(
-            str(html_file)
-        )
-
-        if not source_url:
-            continue
-
-        try:
-            soup = BeautifulSoup(
-                html_file.read_text(
-                    encoding="utf-8",
-                    errors="replace"
-                ),
-                "html.parser"
-            )
-
-            for tag in soup.find_all(True):
-                for attr in (
-                    "href",
-                    "src",
-                    "poster",
-                    "action",
-                    "data-src",
-                    "data-lazy-src",
-                    "data-original"
-                ):
-                    value = tag.get(attr)
-
-                    if not value:
-                        continue
-
-                    if value.startswith((
-                        "data:",
-                        "javascript:",
-                        "mailto:",
-                        "tel:",
-                        "blob:"
-                    )):
-                        continue
-
-                    if value.startswith("#"):
-                        continue
-
-                    absolute = clean_url(
-                        urljoin(source_url, value)
-                    )
-
-                    if not absolute:
-                        continue
-
-                    target = url_to_file.get(absolute)
-
-                    if target:
-                        fragment = urlparse(
-                            urljoin(source_url, value)
-                        ).fragment
-
-                        local = relative_target(
-                            html_file,
-                            target
-                        )
-
-                        if fragment:
-                            local += "#" + fragment
-
-                        tag[attr] = local
-
-                if tag.has_attr("srcset"):
-                    rewritten = []
-
-                    for item in tag["srcset"].split(","):
-                        bits = item.strip().split()
-
-                        if not bits:
-                            continue
-
-                        absolute = clean_url(
-                            urljoin(source_url, bits[0])
-                        )
-
-                        target = url_to_file.get(absolute)
-
-                        if target:
-                            bits[0] = relative_target(
-                                html_file,
-                                target
-                            )
-
-                        rewritten.append(" ".join(bits))
-
-                    tag["srcset"] = ", ".join(rewritten)
-
-            html_file.write_text(
-                str(soup),
-                encoding="utf-8"
-            )
-
-        except Exception as e:
-            errors.append(
-                f"[reescritura HTML] {html_file}: {e}"
-            )
-
-
-# ============================================================
-# REESCRITURA DE CSS
-# ============================================================
-
-def rewrite_css():
-    url_pattern = re.compile(
-        r'''url\(\s*(["']?)(.*?)\1\s*\)''',
-        re.IGNORECASE
-    )
-
-    import_pattern = re.compile(
-        r'''@import\s+(["'])(.*?)\1''',
-        re.IGNORECASE
-    )
-
-    for css_file in ROOT.rglob("*.css"):
-        source_url = source_url_by_file.get(
-            str(css_file)
-        )
-
-        if not source_url:
-            source_url = next(
-                (
-                    url for url, path in url_to_file.items()
-                    if path == css_file
-                ),
-                None
-            )
-
-        if not source_url:
-            continue
-
-        try:
-            content = css_file.read_text(
-                encoding="utf-8",
-                errors="replace"
-            )
-
-            def replace_url(match):
-                quote = match.group(1)
-                raw = match.group(2).strip()
-
-                if raw.startswith((
-                    "data:",
-                    "http://",
-                    "https://",
-                    "#"
-                )):
-                    absolute = clean_url(
-                        urljoin(source_url, raw)
-                    )
-                else:
-                    absolute = clean_url(
-                        urljoin(source_url, raw)
-                    )
-
-                target = url_to_file.get(absolute)
-
-                if target:
-                    local = relative_target(
-                        css_file,
-                        target
-                    )
-                    return f"url({quote}{local}{quote})"
-
-                return match.group(0)
-
-            content = url_pattern.sub(
-                replace_url,
-                content
-            )
-
-            def replace_import(match):
-                quote = match.group(1)
-                raw = match.group(2)
-
-                absolute = clean_url(
-                    urljoin(source_url, raw)
-                )
-
-                target = url_to_file.get(absolute)
-
-                if target:
-                    local = relative_target(
-                        css_file,
-                        target
-                    )
-                    return f"@import {quote}{local}{quote}"
-
-                return match.group(0)
-
-            content = import_pattern.sub(
-                replace_import,
-                content
-            )
-
-            css_file.write_text(
-                content,
-                encoding="utf-8"
-            )
-
-        except Exception as e:
-            errors.append(
-                f"[reescritura CSS] {css_file}: {e}"
-            )
-
-
-# ============================================================
-# PAGINA DE INICIO OFFLINE
-# ============================================================
-
-def create_offline_index():
-    links = []
-
-    for site in SITES:
-        target = local_path_for(site["start"])
-
-        if target and target.exists():
-            local = os.path.relpath(
-                target,
-                ROOT
-            ).replace(os.sep, "/")
-
-            links.append(
-                f'<li><a href="{local}">{site["name"]}</a></li>'
-            )
-
-    html = """<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Documentación offline</title>
-<style>
-body {
-    font-family: Arial, sans-serif;
-    max-width: 850px;
-    margin: 50px auto;
-    padding: 20px;
-    line-height: 1.6;
-    background: #f4f6f8;
-    color: #222;
-}
-main {
-    background: white;
-    padding: 30px;
-    border-radius: 12px;
-}
-a {
-    color: #145db8;
-    font-weight: bold;
-}
-li {
-    margin: 15px 0;
-}
-</style>
-</head>
-<body>
-<main>
-<h1>Documentación de programación offline</h1>
-<p>Selecciona el sitio que deseas consultar:</p>
-<ul>
-""" + "\n".join(links) + """
-</ul>
-</main>
-</body>
-</html>
-"""
-
-    (ROOT / "index-offline.html").write_text(
-        html,
-        encoding="utf-8"
-    )
-
-
-# ============================================================
-# INFORME FINAL
-# ============================================================
-
-def create_report():
-    all_files = [
-        f for f in ROOT.rglob("*")
-        if f.is_file()
-        and not f.name.endswith(".part")
-    ]
-
-    total_bytes = sum(
-        f.stat().st_size for f in all_files
-    )
-
-    report = {
-        "sitios": [
-            {
-                "name": site["name"],
-                "start": site["start"],
-                "hosts": sorted(site["hosts"])
-            }
-            for site in SITES
-        ],
-        "paginas_html": len(page_records),
-        "paginas_por_sitio": html_count_by_site,
-        "documentos_descargados": len(saved_documents),
-        "recursos_capturados": len(saved_assets),
-        "archivos_generados": len(all_files),
-        "tamano_total_bytes": total_bytes,
-        "tamano_total_MB": round(
-            total_bytes / 1024 / 1024, 2
-        ),
-        "urls_video_documento_detectadas": len(download_urls),
-        "descargas_fallidas": len(failed_downloads),
-        "errores": len(errors),
-        "nota": (
-            "Los contenidos que dependen de servidores, "
-            "autenticacion, streaming o API externas pueden "
-            "no funcionar completamente sin conexion."
-        )
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    visited_by_site[site["name"]] = {
+        "paginas_guardadas": pages_saved,
+        "urls_visitadas": len(visited),
+        "urls_pendientes": len(queue),
     }
 
-    Path("informe-descarga.json").write_text(
-        json.dumps(
-            report,
-            ensure_ascii=False,
-            indent=2
-        ),
-        encoding="utf-8"
-    )
-
-    Path("errores-descarga.txt").write_text(
-        "\n".join(errors),
-        encoding="utf-8"
-    )
-
-    Path("descargas-fallidas.txt").write_text(
-        "\n".join(failed_downloads),
-        encoding="utf-8"
-    )
-
-    print("\n========== INFORME FINAL ==========")
-    print(
-        json.dumps(
-            report,
-            ensure_ascii=False,
-            indent=2
-        )
-    )
+    context.close()
 
     print(
-        f"\nDescargas fallidas: {len(failed_downloads)}"
+        f"Finalizado {site['name']}: "
+        f"{pages_saved} páginas guardadas."
     )
-
-    print(f"Errores: {len(errors)}")
 
 
 # ============================================================
-# EJECUCION
+# BUSQUEDA DE DESTINOS LOCALES
 # ============================================================
 
-async def main():
-    # Eliminar MP4 antiguos que en realidad sean HTML.
-    for old_video in ROOT.rglob("*.mp4"):
-        if not is_valid_mp4(old_video):
-            try:
-                old_video.unlink()
-                print(
-                    f"[ELIMINADO MP4 INVALIDO] {old_video}",
-                    flush=True
-                )
-            except Exception as e:
-                errors.append(
-                    f"[eliminar MP4 inválido] {old_video}: {e}"
-                )
+def find_local_target(url):
+    url = clean_url(url)
 
-    timeout = aiohttp.ClientTimeout(
-        total=None,
-        sock_connect=30,
-        sock_read=120
-    )
+    if not url:
+        return None
 
-    connector = aiohttp.TCPConnector(
-        limit=DOWNLOAD_CONCURRENCY,
-        ssl=False
-    )
+    candidates = [url]
 
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector,
-        headers=BROWSER_HEADERS
-    ) as session:
+    parts = urlsplit(url)
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True
-            )
+    without_query = urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        "",
+        ""
+    ))
 
-            context = await browser.new_context(
-                locale="es-ES",
-                timezone_id="America/La_Paz",
-                viewport={
-                    "width": 1440,
-                    "height": 1000
-                },
-                device_scale_factor=1,
-                ignore_https_errors=True,
-                accept_downloads=True
-            )
+    if without_query not in candidates:
+        candidates.append(without_query)
 
-            for site in SITES:
-                await crawl_site(
-                    context,
-                    session,
-                    site
-                )
+    path = parts.path or "/"
 
-            await context.close()
-            await browser.close()
-
-        # Descargar vídeos, SQL, PDF y otros documentos.
-        print(
-            "\n===== DESCARGANDO DOCUMENTOS Y MULTIMEDIA =====",
-            flush=True
+    if path.endswith("/"):
+        candidates.append(
+            urlunsplit((
+                parts.scheme,
+                parts.netloc,
+                path + "index.html",
+                "",
+                ""
+            ))
         )
 
-        semaphore = asyncio.Semaphore(
-            DOWNLOAD_CONCURRENCY
-        )
-
-        tasks = [
-            download_file(
-                session,
-                url,
-                semaphore
-            )
-            for url in sorted(download_urls)
-        ]
-
-        if tasks:
-            await asyncio.gather(
-                *tasks,
-                return_exceptions=True
-            )
-
-    # Reescribir las rutas de las páginas y hojas CSS.
-    print("\n===== REESCRIBIENDO HTML =====")
-    rewrite_html()
-
-    print("\n===== REESCRIBIENDO CSS =====")
-    rewrite_css()
-
-    create_offline_index()
-    create_report()
-
-    print("\n===== PROCESO TERMINADO =====")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    elif not Path(path).suffix:
+        candidates.append(
+            urlunsplit((
+                parts.scheme,
+                parts.netloc,
+                path + ".html",
+                "",
+                ""
+            
