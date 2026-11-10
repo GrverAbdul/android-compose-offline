@@ -1,13 +1,12 @@
 
-name: Descargar documentacion offline con Chromium
+name: Descargar documentación offline
 
 on:
   workflow_dispatch:
     inputs:
       restore_run_id:
-        description: "ID de la ejecucion anterior que contiene la descarga"
+        description: "ID de la ejecución anterior para recuperar el artefacto"
         required: false
-        default: "42815139760"
         type: string
 
 permissions:
@@ -20,8 +19,13 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Obtener el repositorio
+      - name: Descargar repositorio
         uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Recuperar descarga anterior
         if: ${{ inputs.restore_run_id != '' }}
@@ -33,37 +37,39 @@ jobs:
           github-token: ${{ github.token }}
           path: .
 
-      - name: Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
-          pip install playwright beautifulsoup4 aiohttp
+          pip install playwright beautifulsoup4
 
       - name: Instalar Chromium
         run: |
           python -m playwright install --with-deps chromium
 
-      - name: Comprobar recuperacion anterior
+      - name: Descargar y procesar documentación
         run: |
-          echo "Comprobando archivos recuperados..."
+          python descargar_sitios.py
 
-          if [ -d "salida" ]; then
-            echo "Carpeta salida encontrada."
-            find salida -type f | wc -l
+      - name: Mostrar informe
+        if: always()
+        run: |
+          echo "========== INFORME =========="
+
+          if [ -f informe-descarga.json ]; then
+            cat informe-descarga.json
           else
-            echo "No se recupero una carpeta anterior."
-            mkdir -p salida
+            echo "No se generó el informe."
           fi
 
-      - name: Descargar y completar los tres sitios
-        timeout-minutes: 330
-        run: python descargar_sitios.py
+          echo "========== ERRORES =========="
 
-      - name: Comprimir y guardar resultado
+          if [ -f errores-descarga.txt ]; then
+            cat errores-descarga.txt
+          else
+            echo "No se generó el archivo de errores."
+          fi
+
+      - name: Subir documentación
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -72,7 +78,7 @@ jobs:
             salida/
             informe-descarga.json
             errores-descarga.txt
-            descargas-fallidas.txt
           if-no-files-found: warn
           retention-days: 7
           compression-level: 6
+          
