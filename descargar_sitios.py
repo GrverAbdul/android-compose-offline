@@ -12,14 +12,14 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 SITES = [
     {"name": "Codica Basicos", "start": "https://basicos.codica.la/", "hosts": {"basicos.codica.la"}, "max_total_mb": 2048},
     {"name": "W3Docs", "start": "https://es.w3docs.com/", "hosts": {"es.w3docs.com"}, "max_total_mb": 2048},
-    {"name": "CESLAVA Cursos", "start": "https://cursos.ceslava.com/", "hosts": {"cursos.ceslava.com"}, "resource_hosts": {"fonts.googleapis.com", "fonts.gstatic.com"}, "max_total_mb": 2048},
-    {"name": "eLearner", "start": "https://elearner.app/es/", "hosts": {"elearner.app"}, "max_total_mb": 2048},
-    {"name": "DevSchool", "start": "https://devschool.es/", "hosts": {"devschool.es"}, "max_total_mb": 2048},
-    {"name": "CodeRacha", "start": "https://carloswilches.com/", "hosts": {"carloswilches.com", "www.carloswilches.com"}, "max_total_mb": 2048},
-    {"name": "GameCode", "start": "https://gamecode.me/", "hosts": {"gamecode.me"}, "resource_hosts": {"assets.gamecode.me", "cdn.jsdelivr.net", "raw.githubusercontent.com"}, "max_total_mb": 2048},
-    {"name": "Aprende Web desde Cero", "start": "https://cacg-code.github.io/web-desde-cero/", "hosts": {"cacg-code.github.io"}, "resource_hosts": {"cdn.jsdelivr.net"}, "max_total_mb": 2048},
-    {"name": "Tutoriales Programacion Ya", "start": "https://www.tutorialesprogramacionya.com/", "hosts": {"www.tutorialesprogramacionya.com", "tutorialesprogramacionya.com"}, "max_total_mb": 2048},
-    {"name": "Aprende JavaScript", "start": "https://www.aprendejavascript.dev/", "hosts": {"www.aprendejavascript.dev", "aprendejavascript.dev"}, "max_total_mb": 2048},
+    #{"name": "CESLAVA Cursos", "start": "https://cursos.ceslava.com/", "hosts": {"cursos.ceslava.com"}, "resource_hosts": {"fonts.googleapis.com", "fonts.gstatic.com"}, "max_total_mb": 2048},
+    #{"name": "eLearner", "start": "https://elearner.app/es/", "hosts": {"elearner.app"}, "max_total_mb": 2048},
+    #{"name": "DevSchool", "start": "https://devschool.es/", "hosts": {"devschool.es"}, "max_total_mb": 2048},
+    #{"name": "CodeRacha", "start": "https://carloswilches.com/", "hosts": {"carloswilches.com", "www.carloswilches.com"}, "max_total_mb": 2048},
+    #{"name": "GameCode", "start": "https://gamecode.me/", "hosts": {"gamecode.me"}, "resource_hosts": {"assets.gamecode.me", "cdn.jsdelivr.net", "raw.githubusercontent.com"}, "max_total_mb": 2048},
+    #{"name": "Aprende Web desde Cero", "start": "https://cacg-code.github.io/web-desde-cero/", "hosts": {"cacg-code.github.io"}, "resource_hosts": {"cdn.jsdelivr.net"}, "max_total_mb": 2048},
+    #{"name": "Tutoriales Programacion Ya", "start": "https://www.tutorialesprogramacionya.com/", "hosts": {"www.tutorialesprogramacionya.com", "tutorialesprogramacionya.com"}, "max_total_mb": 2048},
+    #{"name": "Aprende JavaScript", "start": "https://www.aprendejavascript.dev/", "hosts": {"www.aprendejavascript.dev", "aprendejavascript.dev"}, "max_total_mb": 2048},
 ]
 ROOT = Path("salida")
 METADATA = ROOT / "_metadata"
