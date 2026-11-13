@@ -3,8 +3,6 @@ import os
 import re
 import json
 import hashlib
-import time
-import traceback
 from pathlib import Path
 from collections import deque
 from urllib.parse import urljoin, urlsplit, urlunsplit, unquote
@@ -12,28 +10,26 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 SITES = [
-    #{"name": "Codica Basicos", "start": "https://basicos.codica.la/", "hosts": {"basicos.codica.la"}, "max_total_mb": 2048},
-    #{"name": "W3Docs", "start": "https://es.w3docs.com/", "hosts": {"es.w3docs.com"}, "max_total_mb": 2048},
-    {"name": "CESLAVA Cursos", "start": "https://cursos.ceslava.com/", "hosts": {"cursos.ceslava.com"}, "resource_hosts": {"fonts.googleapis.com", "fonts.gstatic.com"}, "max_total_mb": 4096},
-    #{"name": "eLearner", "start": "https://elearner.app/es/", "hosts": {"elearner.app"}, "max_total_mb": 2048},
-    #{"name": "DevSchool", "start": "https://devschool.es/", "hosts": {"devschool.es"}, "max_total_mb": 2048},
-    #{"name": "CodeRacha", "start": "https://carloswilches.com/", "hosts": {"carloswilches.com", "www.carloswilches.com"}, "max_total_mb": 2048},
-    #{"name": "GameCode", "start": "https://gamecode.me/", "hosts": {"gamecode.me"}, "resource_hosts": {"assets.gamecode.me", "cdn.jsdelivr.net", "raw.githubusercontent.com"}, "max_total_mb": 2048},
-    #{"name": "Aprende Web desde Cero", "start": "https://cacg-code.github.io/web-desde-cero/", "hosts": {"cacg-code.github.io"}, "resource_hosts": {"cdn.jsdelivr.net"}, "max_total_mb": 2048},
-    #{"name": "Tutoriales Programacion Ya", "start": "https://www.tutorialesprogramacionya.com/", "hosts": {"www.tutorialesprogramacionya.com", "tutorialesprogramacionya.com"}, "max_total_mb": 2048},
-    #{"name": "Aprende JavaScript", "start": "https://www.aprendejavascript.dev/", "hosts": {"www.aprendejavascript.dev", "aprendejavascript.dev"}, "max_total_mb": 2048},
+    {"name": "Codica Basicos", "start": "https://basicos.codica.la/", "hosts": {"basicos.codica.la"}, "max_total_mb": 4096},
+    {"name": "W3Docs", "start": "https://es.w3docs.com/", "hosts": {"es.w3docs.com"}, "max_total_mb": 2048},
+    {"name": "CESLAVA Cursos", "start": "https://cursos.ceslava.com/", "hosts": {"cursos.ceslava.com"}, "resource_hosts": {"fonts.googleapis.com", "fonts.gstatic.com"}, "max_total_mb": 2048},
+    {"name": "eLearner", "start": "https://elearner.app/es/", "hosts": {"elearner.app"}, "max_total_mb": 4096},
+    {"name": "DevSchool", "start": "https://devschool.es/", "hosts": {"devschool.es"}, "max_total_mb": 4096},
+    {"name": "CodeRacha", "start": "https://carloswilches.com/", "hosts": {"carloswilches.com", "www.carloswilches.com"}, "max_total_mb": 4096},
+    {"name": "GameCode", "start": "https://gamecode.me/", "hosts": {"gamecode.me"}, "resource_hosts": {"assets.gamecode.me", "cdn.jsdelivr.net", "raw.githubusercontent.com"}, "max_total_mb": 4096},
+    {"name": "Aprende Web desde Cero", "start": "https://cacg-code.github.io/web-desde-cero/", "hosts": {"cacg-code.github.io"}, "resource_hosts": {"cdn.jsdelivr.net"}, "max_total_mb": 4096},
+    {"name": "Tutoriales Programacion Ya", "start": "https://www.tutorialesprogramacionya.com/", "hosts": {"www.tutorialesprogramacionya.com", "tutorialesprogramacionya.com"}, "max_total_mb": 4096},
+    {"name": "Aprende JavaScript", "start": "https://www.aprendejavascript.dev/", "hosts": {"www.aprendejavascript.dev", "aprendejavascript.dev"}, "max_total_mb": 4096},
 ]
 ROOT = Path("salida")
 METADATA = ROOT / "_metadata"
 URL_MAP_FILE = METADATA / "url-map.json"
 PAGE_MAP_FILE = METADATA / "page-map.json"
-MAX_PAGES_PER_SITE = 8500
-MAX_DEPTH = 30
+MAX_PAGES_PER_SITE = 7500
+MAX_DEPTH = 25
 NAVIGATION_TIMEOUT = 45000
 WAIT_AFTER_LOAD_MS = 1200
-MAX_RESOURCE_SIZE = 1000 * 1024 * 1024
-CESLAVA_PAGE_RETRIES = 2
-CESLAVA_RETRY_DELAYS = (3, 6)
+MAX_RESOURCE_SIZE = 500 * 1024 * 1024
 IGNORED_SCHEMES = ("mailto:", "tel:", "javascript:", "data:", "blob:", "intent:", "about:")
 NON_PAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".css", ".js", ".mjs", ".json", ".xml", ".txt", ".pdf", ".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg", ".zip", ".rar", ".7z", ".tar", ".gz", ".sql", ".db", ".apk", ".exe", ".msi", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".bin", ".webmanifest"}
 HTML_MIME = {"text/html", "application/xhtml+xml"}
@@ -69,7 +65,7 @@ errors = []
 visited_by_site = {}
 site_storage = {}
 def create_site_tracker(site):
-    limit_mb = site.get("max_total_mb", 2048)
+    limit_mb = site.get("max_total_mb", 4096)
     return {"limite_mb": limit_mb, "limite_bytes": int(limit_mb * 1024 * 1024), "bytes_guardados": 0, "archivos": {}, "limite_alcanzado": False}
 def format_mb(byte_count):
     return round(byte_count / 1024 / 1024, 2)
@@ -295,12 +291,6 @@ def save_response_resource(response, site, tracker):
         asset_urls.add(url)
     except Exception as exc:
         errors.append(f"RECURSO | {response.url} | {exc}")
-    except BaseException as exc:
-        if site["name"] != "CESLAVA Cursos" or isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
-            raise
-        detail = traceback.format_exc()
-        errors.append(f"CANCELACIÓN DE RECURSO | {response.url} | {type(exc).__name__}: {exc}\\n{detail}")
-        print(f"   Recurso cancelado; se omite: {response.url} ({type(exc).__name__}: {exc})")
 def extract_page_links(page, current_url, site):
     results = []
     try:
@@ -330,7 +320,7 @@ def is_probable_page(url):
     extension = Path(urlsplit(url).path).suffix.lower()
     return extension not in NON_PAGE_EXTENSIONS
 def crawl_site(browser, site):
-    print("\\n" + "=" * 65)
+    print("\n" + "=" * 65)
     print("SITIO:", site["name"])
     print("INICIO:", site["start"])
     print("LÍMITE TOTAL:", site.get("max_total_mb", 2048), "MB")
@@ -341,14 +331,12 @@ def crawl_site(browser, site):
     context = browser.new_context(ignore_https_errors=True, viewport={"width": 1440, "height": 1000}, locale="es-ES")
     context.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
     context.set_default_timeout(15000)
+    context.on("response", lambda response: save_response_resource(response, site, tracker))
     start = clean_url(site["start"])
     queue = deque([(start, 0)])
     queued = {start}
     visited = set()
     pages_saved = 0
-    is_ceslava = site["name"] == "CESLAVA Cursos"
-    max_attempts = CESLAVA_PAGE_RETRIES + 1 if is_ceslava else 1
-
     while queue and pages_saved < MAX_PAGES_PER_SITE and not tracker["limite_alcanzado"]:
         current_url, depth = queue.popleft()
         current_url = clean_url(current_url)
@@ -360,133 +348,64 @@ def crawl_site(browser, site):
             continue
         if not is_probable_page(current_url):
             continue
-
         visited.add(current_url)
-        print(f"[{site['name']}] ({pages_saved + 1}/{MAX_PAGES_PER_SITE}) {current_url}")
-        page_saved = False
-        stop_site = False
-
-        for attempt in range(1, max_attempts + 1):
-            page = None
-            responses = []
+        page = context.new_page()
+        try:
+            print(f"[{site['name']}] ({pages_saved + 1}/{MAX_PAGES_PER_SITE}) {current_url}")
+            response = page.goto(current_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
+            if response is None:
+                continue
+            if response.status >= 400:
+                errors.append(f"HTTP {response.status} | {current_url}")
+                continue
             try:
-                page = context.new_page()
-                # Registrar las respuestas ahora; sus cuerpos se leerán después
-                # de completar la navegación, fuera del callback del evento.
-                page.on("response", lambda response: responses.append(response))
-                response = page.goto(current_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
-
-                if response is None:
-                    raise RuntimeError("La navegación no devolvió una respuesta.")
-                if response.status >= 400:
-                    errors.append(f"HTTP {response.status} | {current_url}")
-                    print(f"   HTTP {response.status}; se omite esta página.")
-                    break
-
-                try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except PlaywrightTimeoutError:
-                    pass
-
-                page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
-
-                try:
-                    page.evaluate("""
-                        () => {
-                            document.querySelectorAll('img[loading="lazy"]').forEach(img => {
-                                img.loading = 'eager';
-                            });
-                        }
-                    """)
-                except Exception:
-                    pass
-
-                try:
-                    page.locator("details").evaluate_all("elements => elements.forEach(el => el.open = true)")
-                except Exception:
-                    pass
-
-                final_url = clean_url(page.url) or current_url
-                html = page.content()
-                html_bytes = html.encode("utf-8", errors="replace")
-
-                if not looks_like_html(html_bytes):
-                    raise RuntimeError("La respuesta no contiene HTML reconocible.")
-
-                local_file = safe_local_path(final_url, force_html=True, content_type="text/html")
-                if not save_limited_file(local_file, html_bytes, tracker, description=final_url):
-                    stop_site = True
-                    break
-
-                register_url(current_url, local_file, is_page=True)
-                register_url(final_url, local_file, is_page=True)
-                pages_saved += 1
-                page_saved = True
-                print(f"   Almacenamiento: {format_mb(tracker['bytes_guardados'])} / {tracker['limite_mb']} MB")
-
-                links = extract_page_links(page, final_url, site)
-
-                # Procesar las respuestas después de terminar la navegación.
-                # Si un recurso falla, save_response_resource registra el error
-                # y permite continuar con los demás recursos.
-                print(f"   Procesando {len(responses)} respuestas de recursos...")
-                for resource_response in responses:
-                    save_response_resource(resource_response, site, tracker)
-
-                for link in links:
-                    if link in queued or link in visited:
-                        continue
-                    if is_probable_page(link):
-                        queue.append((link, depth + 1))
-                        queued.add(link)
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except PlaywrightTimeoutError:
+                pass
+            page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
+            try:
+                page.evaluate("""
+                    () => {
+                        document.querySelectorAll('img[loading="lazy"]').forEach(img => {
+                            img.loading = 'eager';
+                        });
+                    }
+                """)
+            except Exception:
+                pass
+            try:
+                page.locator("details").evaluate_all("elements => elements.forEach(el => el.open = true)")
+            except Exception:
+                pass
+            final_url = clean_url(page.url) or current_url
+            html = page.content()
+            html_bytes = html.encode("utf-8", errors="replace")
+            if not looks_like_html(html_bytes):
+                errors.append(f"NO HTML | {current_url}")
+                continue
+            local_file = safe_local_path(final_url, force_html=True, content_type="text/html")
+            if not save_limited_file(local_file, html_bytes, tracker, description=final_url):
                 break
-
-            except PlaywrightTimeoutError as exc:
-                detail = traceback.format_exc()
-                errors.append(f"TIMEOUT | {current_url} | intento {attempt}/{max_attempts} | {exc}\\n{detail}")
-                print(f"   TIMEOUT en intento {attempt}/{max_attempts}: {exc}")
-
-            except Exception as exc:
-                detail = traceback.format_exc()
-                errors.append(f"PAGINA | {current_url} | intento {attempt}/{max_attempts} | {exc}\\n{detail}")
-                print(f"   ERROR en intento {attempt}/{max_attempts}: {type(exc).__name__}: {exc}")
-
-            except BaseException as exc:
-                if not is_ceslava or isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
-                    raise
-                detail = traceback.format_exc()
-                errors.append(f"CANCELACIÓN | {current_url} | intento {attempt}/{max_attempts} | {type(exc).__name__}: {exc}\\n{detail}")
-                print(f"   OPERACIÓN CANCELADA en intento {attempt}/{max_attempts}: {type(exc).__name__}: {exc}")
-
-            finally:
-                if page is not None:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
-
-            if page_saved or stop_site:
-                break
-
-            if not browser.is_connected():
-                errors.append(f"NAVEGADOR DESCONECTADO | {current_url} | No se puede continuar con CESLAVA.")
-                print("   El navegador perdió la conexión. Se detiene este sitio.")
-                stop_site = True
-                break
-
-            if attempt < max_attempts:
-                delay = CESLAVA_RETRY_DELAYS[min(attempt - 1, len(CESLAVA_RETRY_DELAYS) - 1)]
-                if is_ceslava:
-                    print(f"   Reintentando en {delay} segundos...")
-                    time.sleep(delay)
-
-        if stop_site:
-            break
-
-        if not page_saved and is_ceslava:
-            errors.append(f"PÁGINA OMITIDA TRAS REINTENTOS | {current_url}")
-            print(f"   Página omitida después de {max_attempts} intentos; se continúa con la siguiente.")
-
+            register_url(current_url, local_file, is_page=True)
+            register_url(final_url, local_file, is_page=True)
+            pages_saved += 1
+            print(f"   Almacenamiento: {format_mb(tracker['bytes_guardados'])} / {tracker['limite_mb']} MB")
+            links = extract_page_links(page, final_url, site)
+            for link in links:
+                if link in queued or link in visited:
+                    continue
+                if is_probable_page(link):
+                    queue.append((link, depth + 1))
+                    queued.add(link)
+        except PlaywrightTimeoutError:
+            errors.append(f"TIMEOUT | {current_url}")
+        except Exception as exc:
+            errors.append(f"PAGINA | {current_url} | {exc}")
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
     visited_by_site[site["name"]] = {
         "paginas_guardadas": pages_saved,
         "urls_visitadas": len(visited),
@@ -496,7 +415,7 @@ def crawl_site(browser, site):
         "limite_alcanzado": tracker["limite_alcanzado"],
     }
     context.close()
-    print("\\n" + "-" * 55)
+    print("\n" + "-" * 55)
     print("FINALIZADO:", site["name"])
     print("Páginas:", pages_saved)
     print("Almacenamiento:", format_mb(tracker["bytes_guardados"]), "MB de", tracker["limite_mb"], "MB")
