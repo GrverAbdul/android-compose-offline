@@ -341,7 +341,6 @@ def crawl_site(browser, site):
     context = browser.new_context(ignore_https_errors=True, viewport={"width": 1440, "height": 1000}, locale="es-ES")
     context.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
     context.set_default_timeout(15000)
-    context.on("response", lambda response: save_response_resource(response, site, tracker))
     start = clean_url(site["start"])
     queue = deque([(start, 0)])
     queued = {start}
@@ -369,8 +368,12 @@ def crawl_site(browser, site):
 
         for attempt in range(1, max_attempts + 1):
             page = None
+            responses = []
             try:
                 page = context.new_page()
+                # Registrar las respuestas ahora; sus cuerpos se leerán después
+                # de completar la navegación, fuera del callback del evento.
+                page.on("response", responses.append)
                 response = page.goto(current_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
 
                 if response is None:
@@ -422,6 +425,14 @@ def crawl_site(browser, site):
                 print(f"   Almacenamiento: {format_mb(tracker['bytes_guardados'])} / {tracker['limite_mb']} MB")
 
                 links = extract_page_links(page, final_url, site)
+
+                # Procesar las respuestas después de terminar la navegación.
+                # Si un recurso falla, save_response_resource registra el error
+                # y permite continuar con los demás recursos.
+                print(f"   Procesando {len(responses)} respuestas de recursos...")
+                for resource_response in responses:
+                    save_response_resource(resource_response, site, tracker)
+
                 for link in links:
                     if link in queued or link in visited:
                         continue
