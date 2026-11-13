@@ -373,7 +373,7 @@ def crawl_site(browser, site):
                 page = context.new_page()
                 # Registrar las respuestas ahora; sus cuerpos se leerán después
                 # de completar la navegación, fuera del callback del evento.
-                page.on("response", responses.append)
+                page.on("response", lambda response: responses.append(response))
                 response = page.goto(current_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
 
                 if response is None:
