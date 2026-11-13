@@ -12,8 +12,8 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 SITES = [
     #{"name": "Codica Basicos", "start": "https://basicos.codica.la/", "hosts": {"basicos.codica.la"}, "max_total_mb": 2048},
     #{"name": "W3Docs", "start": "https://es.w3docs.com/", "hosts": {"es.w3docs.com"}, "max_total_mb": 2048},
-    {"name": "CESLAVA Cursos", "start": "https://cursos.ceslava.com/", "hosts": {"cursos.ceslava.com"}, "resource_hosts": {"fonts.googleapis.com", "fonts.gstatic.com"}, "max_total_mb": 2048},
-    {"name": "eLearner", "start": "https://elearner.app/es/", "hosts": {"elearner.app"}, "max_total_mb": 2048},
+    {"name": "CESLAVA Cursos", "start": "https://cursos.ceslava.com/", "hosts": {"cursos.ceslava.com"}, "resource_hosts": {"fonts.googleapis.com", "fonts.gstatic.com"}, "max_total_mb": 4096},
+    #{"name": "eLearner", "start": "https://elearner.app/es/", "hosts": {"elearner.app"}, "max_total_mb": 2048},
     #{"name": "DevSchool", "start": "https://devschool.es/", "hosts": {"devschool.es"}, "max_total_mb": 2048},
     #{"name": "CodeRacha", "start": "https://carloswilches.com/", "hosts": {"carloswilches.com", "www.carloswilches.com"}, "max_total_mb": 2048},
     #{"name": "GameCode", "start": "https://gamecode.me/", "hosts": {"gamecode.me"}, "resource_hosts": {"assets.gamecode.me", "cdn.jsdelivr.net", "raw.githubusercontent.com"}, "max_total_mb": 2048},
@@ -25,11 +25,11 @@ ROOT = Path("salida")
 METADATA = ROOT / "_metadata"
 URL_MAP_FILE = METADATA / "url-map.json"
 PAGE_MAP_FILE = METADATA / "page-map.json"
-MAX_PAGES_PER_SITE = 7500
-MAX_DEPTH = 25
+MAX_PAGES_PER_SITE = 8500
+MAX_DEPTH = 30
 NAVIGATION_TIMEOUT = 45000
 WAIT_AFTER_LOAD_MS = 1200
-MAX_RESOURCE_SIZE = 500 * 1024 * 1024
+MAX_RESOURCE_SIZE = 1000 * 1024 * 1024
 IGNORED_SCHEMES = ("mailto:", "tel:", "javascript:", "data:", "blob:", "intent:", "about:")
 NON_PAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".css", ".js", ".mjs", ".json", ".xml", ".txt", ".pdf", ".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg", ".zip", ".rar", ".7z", ".tar", ".gz", ".sql", ".db", ".apk", ".exe", ".msi", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".bin", ".webmanifest"}
 HTML_MIME = {"text/html", "application/xhtml+xml"}
