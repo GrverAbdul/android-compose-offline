@@ -10,10 +10,10 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 SITES = [
-    {"name": "Codica Basicos", "start": "https://basicos.codica.la/", "hosts": {"basicos.codica.la"}, "max_total_mb": 2048},
-    {"name": "W3Docs", "start": "https://es.w3docs.com/", "hosts": {"es.w3docs.com"}, "max_total_mb": 2048},
-    #{"name": "CESLAVA Cursos", "start": "https://cursos.ceslava.com/", "hosts": {"cursos.ceslava.com"}, "resource_hosts": {"fonts.googleapis.com", "fonts.gstatic.com"}, "max_total_mb": 2048},
-    #{"name": "eLearner", "start": "https://elearner.app/es/", "hosts": {"elearner.app"}, "max_total_mb": 2048},
+    #{"name": "Codica Basicos", "start": "https://basicos.codica.la/", "hosts": {"basicos.codica.la"}, "max_total_mb": 2048},
+    #{"name": "W3Docs", "start": "https://es.w3docs.com/", "hosts": {"es.w3docs.com"}, "max_total_mb": 2048},
+    {"name": "CESLAVA Cursos", "start": "https://cursos.ceslava.com/", "hosts": {"cursos.ceslava.com"}, "resource_hosts": {"fonts.googleapis.com", "fonts.gstatic.com"}, "max_total_mb": 2048},
+    {"name": "eLearner", "start": "https://elearner.app/es/", "hosts": {"elearner.app"}, "max_total_mb": 2048},
     #{"name": "DevSchool", "start": "https://devschool.es/", "hosts": {"devschool.es"}, "max_total_mb": 2048},
     #{"name": "CodeRacha", "start": "https://carloswilches.com/", "hosts": {"carloswilches.com", "www.carloswilches.com"}, "max_total_mb": 2048},
     #{"name": "GameCode", "start": "https://gamecode.me/", "hosts": {"gamecode.me"}, "resource_hosts": {"assets.gamecode.me", "cdn.jsdelivr.net", "raw.githubusercontent.com"}, "max_total_mb": 2048},
