@@ -31,8 +31,8 @@ PAGE_MAP_FILE = METADATA / "page-map.json"
 MAX_PAGES_PER_SITE = 20000
 MAX_DEPTH = 35
 NAVIGATION_TIMEOUT = 60000
-WAIT_AFTER_LOAD_MS = 1600
-NETWORK_IDLE_TIMEOUT = 15000
+WAIT_AFTER_LOAD_MS = 1000
+NETWORK_IDLE_TIMEOUT = 4000
 CONCURRENT_PAGES = 3
 MAX_RESOURCE_SIZE = 700 * 1024 * 1024
 
@@ -587,6 +587,8 @@ async def crawl_site(browser, site):
     print("LÍMITE TOTAL:", site.get("max_total_mb", 2048), "MB")
     print("LÍMITE POR ARCHIVO:", format_mb(MAX_RESOURCE_SIZE), "MB")
     print("PÁGINAS SIMULTÁNEAS:", CONCURRENT_PAGES)
+    print("ESPERA NETWORK IDLE:", NETWORK_IDLE_TIMEOUT, "ms")
+    print("ESPERA ADICIONAL:", WAIT_AFTER_LOAD_MS, "ms")
     print("=" * 65)
 
     tracker = create_site_tracker(site)
@@ -641,6 +643,24 @@ async def crawl_site(browser, site):
                 errors.append(f"HTTP {response.status} | {current_url}")
                 return False, []
 
+            # Abre contenido plegado y activa imágenes diferidas antes de
+            # esperar a que la red quede inactiva.
+            try:
+                await page.evaluate("""
+                    () => {
+                        document.querySelectorAll('details').forEach(el => {
+                            el.open = true;
+                        });
+                        document.querySelectorAll('img[loading="lazy"]').forEach(img => {
+                            img.loading = 'eager';
+                        });
+                    }
+                """)
+            except Exception:
+                pass
+
+            # Mantiene networkidle para conservar recursos dinámicos, pero
+            # limita la espera máxima a 4 segundos en vez de 15.
             try:
                 await page.wait_for_load_state(
                     "networkidle",
@@ -650,24 +670,6 @@ async def crawl_site(browser, site):
                 pass
 
             await page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
-
-            try:
-                await page.evaluate("""
-                    () => {
-                        document.querySelectorAll('img[loading="lazy"]').forEach(img => {
-                            img.loading = 'eager';
-                        });
-                    }
-                """)
-            except Exception:
-                pass
-
-            try:
-                await page.locator("details").evaluate_all(
-                    "elements => elements.forEach(el => el.open = true)"
-                )
-            except Exception:
-                pass
 
             final_url = clean_url(page.url) or current_url
 
@@ -916,18 +918,27 @@ def relative_target(source_file, target_file):
     ).replace(os.sep, "/")
 
 
+def normalized_file_key(path):
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def build_file_url_index():
+    """Crea un índice O(n) para evitar buscar cada archivo en todo el mapa."""
+    index = {}
+
+    for known_file, known_url in file_to_url.items():
+        index.setdefault(normalized_file_key(known_file), known_url)
+
+    return index
+
+
 def rewrite_html():
+    file_url_index = build_file_url_index()
     for html_file in ROOT.rglob("*.html"):
         if "_metadata" in html_file.parts:
             continue
 
-        source_url = file_to_url.get(str(html_file))
-
-        if not source_url:
-            for known_file, known_url in file_to_url.items():
-                if Path(known_file) == html_file:
-                    source_url = known_url
-                    break
+        source_url = file_url_index.get(normalized_file_key(html_file))
 
         if not source_url:
             continue
@@ -997,6 +1008,8 @@ def rewrite_html():
 
 
 def rewrite_css():
+    file_url_index = build_file_url_index()
+
     url_pattern = re.compile(
         r"url\(\s*([\"']?)(.*?)\1\s*\)",
         re.IGNORECASE
@@ -1011,13 +1024,7 @@ def rewrite_css():
         if "_metadata" in css_file.parts:
             continue
 
-        source_url = file_to_url.get(str(css_file))
-
-        if not source_url:
-            for known_file, known_url in file_to_url.items():
-                if Path(known_file) == css_file:
-                    source_url = known_url
-                    break
+        source_url = file_url_index.get(normalized_file_key(css_file))
 
         if not source_url:
             continue
@@ -1220,6 +1227,8 @@ async def main():
     print("PROFUNDIDAD MÁXIMA:", MAX_DEPTH)
     print("MÁXIMO POR ARCHIVO:", format_mb(MAX_RESOURCE_SIZE), "MB")
     print("PÁGINAS SIMULTÁNEAS:", CONCURRENT_PAGES)
+    print("ESPERA NETWORK IDLE:", NETWORK_IDLE_TIMEOUT, "ms")
+    print("ESPERA ADICIONAL:", WAIT_AFTER_LOAD_MS, "ms")
     print("=" * 65)
 
     load_previous_maps()
