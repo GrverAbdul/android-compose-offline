@@ -21,6 +21,11 @@ SITES = [
     {"name": "Curso Linux Ciberaula", "start": "https://linux.ciberaula.com/curso/", "hosts": {"linux.ciberaula.com", "www.linux.ciberaula.com"}, "max_total_mb": 4096},
     #{"name": "Tutoriales Programacion Ya", "start": "https://www.tutorialesprogramacionya.com/", "hosts": {"www.tutorialesprogramacionya.com", "tutorialesprogramacionya.com"}, "max_total_mb": 4096},
     #{"name": "Aprende JavaScript", "start": "https://www.aprendejavascript.dev/", "hosts": {"www.aprendejavascript.dev", "aprendejavascript.dev"}, "max_total_mb": 4096},
+    {"name": "Programa de Ciberseguridad Moderna", "start": "https://vladimiracunadev-create.github.io/modern-cybersecurity-program/", "hosts": {"vladimiracunadev-create.github.io"}, "max_total_mb": 4096},
+    {"name": "Apuntes DAM", "start": "https://apuntes-dam.github.io/apuntes-lenguajes/", "hosts": {"apuntes-dam.github.io"}, "max_total_mb": 4096},
+    {"name": "UJACKING", "start": "https://ujacking.github.io/", "hosts": {"ujacking.github.io"}, "max_total_mb": 4096},
+    {"name": "JavaScript.info Español", "start": "https://es.javascript.info/", "hosts": {"es.javascript.info"}, "max_total_mb": 4096},
+    {"name": "Python Práctico", "start": "https://pythonpanama.github.io/pythonpractico/", "hosts": {"pythonpanama.github.io"}, "max_total_mb": 4096},
 ]
 
 
