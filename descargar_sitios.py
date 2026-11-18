@@ -29,7 +29,7 @@ SITES = [
     {"name": "Makigas", "start": "https://www.makigas.es/", "hosts": {"www.makigas.es"}, "max_total_mb": 4096},
     {"name": "Duobi Cursos", "start": "https://www.duobi.tech/cursos", "hosts": {"www.duobi.tech"}, "max_total_mb": 4096},
     {"name": "Pro Git Español", "start": "https://git-scm.com/book/es/v2", "hosts": {"git-scm.com"}, "max_total_mb": 4096},
-    {"name": "Full Stack Open Español", "start": "https://fullstackopen.com/es/", "hosts": {"fullstackopen.com"}, "max_total_mb": 4096},
+    #{"name": "Full Stack Open Español", "start": "https://fullstackopen.com/es/", "hosts": {"fullstackopen.com"}, "max_total_mb": 4096},
 ]
 
 ROOT = Path("salida")
