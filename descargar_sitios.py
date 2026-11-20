@@ -32,8 +32,8 @@ SITES = [
     #{"name": "Duobi Cursos", "start": "https://www.duobi.tech/cursos", "hosts": {"www.duobi.tech"}, "max_total_mb": 4096},
     #{"name": "Pro Git Español", "start": "https://git-scm.com/book/es/v2", "hosts": {"git-scm.com"}, "max_total_mb": 4096},
     #{"name": "Full Stack Open Español", "start": "https://fullstackopen.com/es/", "hosts": {"fullstackopen.com"}, "max_total_mb": 4096},
-    {"name": "MDN Web Docs - Español e Inglés", "start": "https://developer.mozilla.org/es/", "starts": ["https://developer.mozilla.org/es/", "https://developer.mozilla.org/en-US/"], "hosts": {"developer.mozilla.org"}, "allowed_paths": ["/es/", "/en-US/"], "max_total_mb": 10000},
-    {"name": "Curso Completo de Ciberseguridad - Antinori Ariel", "start": "https://github.com/antinoriariel/curso_ciberseguridad", "hosts": {"github.com"}, "allowed_paths": ["/antinoriariel/curso_ciberseguridad"], "resource_hosts": {"raw.githubusercontent.com"}, "max_total_mb": 5000},
+    {"name": "MDN Web Docs - Español prioritario + inglés complementario", "start": "https://developer.mozilla.org/es/", "starts": ["https://developer.mozilla.org/es/", "https://developer.mozilla.org/en-US/"], "hosts": {"developer.mozilla.org"}, "allowed_paths": ["/es/", "/en-US/"], "exclude_paths": ["/en-US/play"], "language_strategy": "mdn_es_then_en", "max_total_mb": 10000},
+    #{"name": "Curso Completo de Ciberseguridad - Antinori Ariel", "start": "https://github.com/antinoriariel/curso_ciberseguridad", "hosts": {"github.com"}, "allowed_paths": ["/antinoriariel/curso_ciberseguridad"], "resource_hosts": {"raw.githubusercontent.com"}, "max_total_mb": 5000},
     
 ]
 
@@ -102,6 +102,7 @@ resource_locks = {}
 errors = []
 visited_by_site = {}
 site_storage = {}
+mdn_language_stats = {}
 
 
 def create_site_tracker(site):
@@ -220,6 +221,15 @@ def is_allowed_page(url, site):
     if not is_internal(url, site):
         return False
 
+    try:
+        path = urlsplit(url).path or "/"
+        for excluded in site.get("exclude_paths", []):
+            excluded = excluded.rstrip("/") or "/"
+            if path == excluded or path.startswith(excluded + "/"):
+                return False
+    except Exception:
+        return False
+
     allowed_paths = site.get("allowed_paths")
 
     if not allowed_paths:
@@ -241,6 +251,76 @@ def is_allowed_page(url, site):
 
     except Exception:
         return False
+
+
+def mdn_spanish_counterpart(english_url, html=""):
+    """Encuentra la traducción es anunciada por MDN o deriva su ruta equivalente."""
+    try:
+        parts = urlsplit(clean_url(english_url))
+        if parts.hostname != "developer.mozilla.org":
+            return None
+        path = parts.path or "/"
+        if path == "/en-US/":
+            return "https://developer.mozilla.org/es/"
+        if not path.startswith("/en-US/docs/"):
+            return None
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+            for link in soup.find_all("link", href=True):
+                rel = link.get("rel", [])
+                rel = [str(x).lower() for x in (rel if isinstance(rel, list) else [rel])]
+                hreflang = str(link.get("hreflang", "")).lower()
+                if "alternate" in rel and hreflang in ("es", "es-es", "es-mx"):
+                    candidate = clean_url(urljoin(english_url, link["href"]))
+                    cp = urlsplit(candidate)
+                    if cp.hostname == "developer.mozilla.org" and cp.path.startswith("/es/docs/"):
+                        return urlunsplit((cp.scheme, cp.netloc, cp.path, "", ""))
+        spanish_path = "/es/docs/" + path[len("/en-US/docs/"):]
+        return urlunsplit((parts.scheme, parts.netloc, spanish_path, "", ""))
+    except Exception:
+        return None
+
+
+async def mdn_translation_status(context, spanish_url, cache, locks):
+    """True=traducción española confirmada; False=no existe; None=no verificable."""
+    spanish_url = clean_url(spanish_url)
+    if not spanish_url:
+        return None
+    if spanish_url in cache:
+        return cache[spanish_url]
+    lock = locks.setdefault(spanish_url, asyncio.Lock())
+    async with lock:
+        if spanish_url in cache:
+            return cache[spanish_url]
+        result = None
+        for attempt in range(1, 3):
+            try:
+                response = await context.request.get(
+                    spanish_url, timeout=NAVIGATION_TIMEOUT,
+                    headers={"Accept-Language": "es-ES,es;q=0.9"}
+                )
+                status = response.status
+                if status in (404, 410):
+                    result = False
+                    break
+                if status == 200:
+                    body = await response.text()
+                    soup = BeautifulSoup(body, "html.parser")
+                    lang = str(soup.html.get("lang", "")).lower() if soup.html else ""
+                    final_parts = urlsplit(clean_url(response.url))
+                    title = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
+                    missing = any(x in title for x in ("page not found", "página no encontrada", "404"))
+                    result = bool(lang.startswith("es") and final_parts.path.startswith("/es/") and not missing)
+                    break
+                if status < 500 and status != 429:
+                    result = False
+                    break
+            except Exception:
+                pass
+            if attempt < 2:
+                await asyncio.sleep(0.5 * attempt)
+        cache[spanish_url] = result
+        return result
 
 
 def is_allowed_resource(url, site):
@@ -668,6 +748,13 @@ async def crawl_site(browser, site):
     failed_pages = {}
     retry_count = 0
     pages_saved = 0
+    pages_processed = 0
+    mdn_translation_cache = {}
+    mdn_translation_locks = {}
+    mdn_english_skipped = 0
+    mdn_english_saved = 0
+    mdn_translation_unknown = 0
+    mdn_aliases = []
     resource_tasks = set()
 
     worker_count = PAGE_WORKERS
@@ -684,7 +771,8 @@ async def crawl_site(browser, site):
         attach_resource_listener(page)
 
     async def worker(worker_id, page):
-        nonlocal pages_saved, retry_count
+        nonlocal pages_saved, pages_processed, retry_count
+        nonlocal mdn_english_skipped, mdn_english_saved, mdn_translation_unknown
 
         while True:
             item = await queue.get()
@@ -706,7 +794,7 @@ async def crawl_site(browser, site):
                     continue
                 if depth > MAX_DEPTH:
                     continue
-                if pages_saved >= MAX_PAGES_PER_SITE or tracker["limite_alcanzado"]:
+                if pages_processed >= MAX_PAGES_PER_SITE or tracker["limite_alcanzado"]:
                     continue
                 if not is_allowed_page(current_url, site) or not is_probable_page(current_url):
                     continue
@@ -719,7 +807,7 @@ async def crawl_site(browser, site):
 
                 print(
                     f"[{site['name']}] [Trabajador {worker_id}] "
-                    f"({pages_saved + 1}/{MAX_PAGES_PER_SITE}) "
+                    f"({pages_processed + 1}/{MAX_PAGES_PER_SITE}) "
                     f"Intento {attempt}/{MAX_PAGE_ATTEMPTS}: {current_url}"
                 )
 
@@ -824,28 +912,55 @@ async def crawl_site(browser, site):
                     errors.append(f"NO HTML | {current_url}")
                     continue
 
-                if pages_saved >= MAX_PAGES_PER_SITE or tracker["limite_alcanzado"]:
+                if pages_processed >= MAX_PAGES_PER_SITE or tracker["limite_alcanzado"]:
                     eligible_for_retry = False
                     continue
 
-                local_file = safe_local_path(
-                    final_url, force_html=True, content_type="text/html"
-                )
-                if not save_limited_file(local_file, html_bytes, tracker, description=final_url):
-                    eligible_for_retry = False
-                    continue
+                # MDN: español tiene prioridad; solo se guarda inglés si no hay traducción.
+                store_page = True
+                spanish_counterpart = None
+                if site.get("language_strategy") == "mdn_es_then_en":
+                    final_parts = urlsplit(final_url)
+                    if final_parts.path.startswith("/en-US/docs/") or final_parts.path == "/en-US/":
+                        spanish_counterpart = mdn_spanish_counterpart(final_url, html)
+                        if spanish_counterpart:
+                            translation_exists = await mdn_translation_status(
+                                context, spanish_counterpart,
+                                mdn_translation_cache, mdn_translation_locks
+                            )
+                            if translation_exists is True:
+                                store_page = False
+                                mdn_english_skipped += 1
+                                mdn_aliases.append((current_url, spanish_counterpart))
+                                if spanish_counterpart not in queued and spanish_counterpart not in visited and spanish_counterpart not in in_progress:
+                                    queued.add(spanish_counterpart)
+                                    queue.put_nowait((spanish_counterpart, depth + 1, 1))
+                                print(f"   Inglés omitido: existe versión española -> {spanish_counterpart}")
+                            elif translation_exists is None:
+                                mdn_translation_unknown += 1
+                                errors.append(f"TRADUCCIÓN MDN NO VERIFICADA; se conserva inglés | {final_url} | {spanish_counterpart}")
 
-                register_url(current_url, local_file, is_page=True)
-                register_url(final_url, local_file, is_page=True)
+                if store_page:
+                    local_file = safe_local_path(
+                        final_url, force_html=True, content_type="text/html"
+                    )
+                    if not save_limited_file(local_file, html_bytes, tracker, description=final_url):
+                        eligible_for_retry = False
+                        continue
+                    register_url(current_url, local_file, is_page=True)
+                    register_url(final_url, local_file, is_page=True)
+                    pages_saved += 1
+                    if urlsplit(final_url).path.startswith("/en-US/"):
+                        mdn_english_saved += 1
+                    print(
+                        f"   Guardada: {pages_saved} | Almacenamiento: "
+                        f"{format_mb(tracker['bytes_guardados'])} / {tracker['limite_mb']} MB"
+                    )
+
                 visited.add(current_url)
                 visited.add(final_url)
-                pages_saved += 1
+                pages_processed += 1
                 success = True
-
-                print(
-                    f"   Guardada: {pages_saved} | Almacenamiento: "
-                    f"{format_mb(tracker['bytes_guardados'])} / {tracker['limite_mb']} MB"
-                )
 
                 # Una vez guardado el HTML, un fallo al extraer enlaces no debe
                 # provocar que se descargue de nuevo la misma página.
@@ -913,7 +1028,23 @@ async def crawl_site(browser, site):
         except Exception:
             pass
 
+    # Los enlaces ingleses omitidos se redirigen al archivo local español equivalente.
+    for english_url, spanish_url in mdn_aliases:
+        spanish_file = url_to_file.get(clean_url(spanish_url))
+        if spanish_file and Path(spanish_file).is_file():
+            register_url(english_url, spanish_file, is_page=True)
+
+    if site.get("language_strategy") == "mdn_es_then_en":
+        mdn_language_stats[site["name"]] = {
+            "paginas_inglesas_omitidas_por_traduccion_espanola": mdn_english_skipped,
+            "paginas_inglesas_guardadas_por_no_tener_traduccion": mdn_english_saved,
+            "traducciones_no_verificadas_se_conservo_ingles": mdn_translation_unknown,
+            "equivalencias_detectadas": len(mdn_aliases),
+            "rutas_excluidas": site.get("exclude_paths", [])
+        }
+
     visited_by_site[site["name"]] = {
+        "paginas_procesadas": pages_processed,
         "paginas_guardadas": pages_saved,
         "urls_descubiertas": len(queued),
         "paginas_completadas": len(visited),
@@ -1280,6 +1411,7 @@ def create_report():
         ],
         "almacenamiento_por_sitio": storage_report,
         "paginas_por_sitio": visited_by_site,
+        "seleccion_bilingue_mdn": mdn_language_stats,
         "paginas_en_mapa": len(page_urls),
         "recursos_capturados": len(asset_urls),
         "archivos_generados": len(files),
@@ -1295,6 +1427,9 @@ def create_report():
             "Los límites por sitio contabilizan los archivos guardados "
             "durante esta ejecución. El tamaño total de la carpeta salida "
             "también puede incluir archivos de ejecuciones anteriores. "
+            "MDN usa español como idioma prioritario y conserva en inglés "
+            "las páginas /en-US/docs/ cuyo equivalente /es/docs/ no existe. "
+            "Se excluye /en-US/play y se conserva /es/play. "
             "Los contenidos dependientes de APIs, autenticación, streaming "
             "o servidores externos pueden no funcionar completamente "
             "sin conexión."
