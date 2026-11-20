@@ -43,7 +43,10 @@ PAGE_MAP_FILE = METADATA / "page-map.json"
 MAX_PAGES_PER_SITE = 20000
 MAX_DEPTH = 35
 NAVIGATION_TIMEOUT = 45000
-WAIT_AFTER_LOAD_MS = 2000
+NETWORK_IDLE_TIMEOUT = 5000
+WAIT_AFTER_LOAD_MS = 400
+LAZY_SCROLL_STEP_MS = 80
+MAX_LAZY_SCROLL_STEPS = 30
 MAX_RESOURCE_SIZE = 700 * 1024 * 1024
 
 IGNORED_SCHEMES = ("mailto:", "tel:", "javascript:", "data:", "blob:", "intent:", "about:")
@@ -492,6 +495,12 @@ def save_response_resource(response, site, tracker):
         if not url or not is_allowed_resource(url, site):
             return
 
+        # Evita descargar y escribir repetidamente CSS, JS, fuentes e imágenes
+        # compartidos por cientos de páginas.
+        existing_file = url_to_file.get(url)
+        if existing_file and Path(existing_file).is_file():
+            return
+
         allowed = {
             "stylesheet",
             "script",
@@ -616,11 +625,17 @@ def crawl_site(browser, site):
         lambda response: save_response_resource(response, site, tracker)
     )
 
-    start = clean_url(site["start"])
-    queue = deque([(start, 0)])
-    queued = {start}
+    starts = site.get("starts", [site["start"]])
+    initial_urls = list(dict.fromkeys(
+        clean_url(url) for url in starts if clean_url(url)
+    ))
+    queue = deque((url, 0) for url in initial_urls)
+    queued = set(initial_urls)
     visited = set()
     pages_saved = 0
+
+    # Reutilizar una sola pestaña evita crear y destruir miles de páginas.
+    page = context.new_page()
 
     while (
         queue
@@ -644,7 +659,6 @@ def crawl_site(browser, site):
             continue
 
         visited.add(current_url)
-        page = context.new_page()
 
         try:
             print(
@@ -666,24 +680,62 @@ def crawl_site(browser, site):
                 errors.append(f"HTTP {response.status} | {current_url}")
                 continue
 
+            # Espera a que terminen las solicitudes de red, pero con un límite
+            # para no quedar atrapado por analítica, anuncios o conexiones persistentes.
             try:
-                page.wait_for_load_state("networkidle", timeout=10000)
+                page.wait_for_load_state(
+                    "networkidle",
+                    timeout=NETWORK_IDLE_TIMEOUT
+                )
             except PlaywrightTimeoutError:
                 pass
 
-            page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
-
+            # Activa y desplaza únicamente páginas que realmente tengan imágenes
+            # diferidas. Así se conservan imágenes lazy-load sin penalizar cada página.
             try:
-                page.evaluate("""
-                    () => {
-                        document.querySelectorAll('img[loading="lazy"]').forEach(img => {
-                            img.loading = 'eager';
-                        });
-                    }
-                """)
-            except Exception:
-                pass
+                lazy_count = page.locator(
+                    'img[loading="lazy"], img[data-src], img[data-lazy-src]'
+                ).count()
 
+                if lazy_count:
+                    page.evaluate("""
+                        () => {
+                            document.querySelectorAll(
+                                'img[loading="lazy"], img[data-src], img[data-lazy-src]'
+                            ).forEach(img => {
+                                img.loading = 'eager';
+                                if (!img.src && img.dataset.src) img.src = img.dataset.src;
+                                if (!img.src && img.dataset.lazySrc) img.src = img.dataset.lazySrc;
+                            });
+                        }
+                    """)
+
+                    page.evaluate(
+                        """async (maxSteps, delay) => {
+                            const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+                            const height = Math.max(
+                                document.body.scrollHeight,
+                                document.documentElement.scrollHeight
+                            );
+                            const step = Math.max(window.innerHeight, Math.ceil(height / maxSteps));
+
+                            for (let y = 0, n = 0; y < height && n < maxSteps; y += step, n++) {
+                                window.scrollTo(0, y);
+                                await pause(delay);
+                            }
+
+                            window.scrollTo(0, 0);
+                        }""",
+                        MAX_LAZY_SCROLL_STEPS,
+                        LAZY_SCROLL_STEP_MS
+                    )
+                    page.wait_for_timeout(300)
+                else:
+                    page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
+            except Exception:
+                page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
+
+            # Abre los desplegables antes de guardar el HTML.
             try:
                 page.locator("details").evaluate_all(
                     "elements => elements.forEach(el => el.open = true)"
@@ -752,10 +804,12 @@ def crawl_site(browser, site):
             errors.append(f"PAGINA | {current_url} | {exc}")
 
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            pass
+
+    try:
+        page.close()
+    except Exception:
+        pass
 
     visited_by_site[site["name"]] = {
         "paginas_guardadas": pages_saved,
@@ -883,12 +937,6 @@ def rewrite_html():
         source_url = file_to_url.get(str(html_file))
 
         if not source_url:
-            for known_file, known_url in file_to_url.items():
-                if Path(known_file) == html_file:
-                    source_url = known_url
-                    break
-
-        if not source_url:
             continue
 
         try:
@@ -971,12 +1019,6 @@ def rewrite_css():
             continue
 
         source_url = file_to_url.get(str(css_file))
-
-        if not source_url:
-            for known_file, known_url in file_to_url.items():
-                if Path(known_file) == css_file:
-                    source_url = known_url
-                    break
 
         if not source_url:
             continue
@@ -1143,6 +1185,8 @@ def create_report():
         "tamano_total_bytes": total_bytes,
         "tamano_total_MB": round(total_bytes / 1024 / 1024, 2),
         "limite_por_recurso_MB": format_mb(MAX_RESOURCE_SIZE),
+        "network_idle_timeout_ms": NETWORK_IDLE_TIMEOUT,
+        "espera_adicional_ms": WAIT_AFTER_LOAD_MS,
         "errores": len(errors),
         "nota": (
             "Los límites por sitio contabilizan los archivos guardados "
