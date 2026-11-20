@@ -1,12 +1,14 @@
 import os
+import asyncio
 import re
 import json
 import hashlib
 from pathlib import Path
 from collections import deque
+from functools import lru_cache
 from urllib.parse import urljoin, urlsplit, urlunsplit, unquote
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 SITES = [
     #{"name": "Codica Basicos", "start": "https://basicos.codica.la/", "hosts": {"basicos.codica.la"}, "max_total_mb": 4096},
@@ -30,8 +32,8 @@ SITES = [
     #{"name": "Duobi Cursos", "start": "https://www.duobi.tech/cursos", "hosts": {"www.duobi.tech"}, "max_total_mb": 4096},
     #{"name": "Pro Git Español", "start": "https://git-scm.com/book/es/v2", "hosts": {"git-scm.com"}, "max_total_mb": 4096},
     #{"name": "Full Stack Open Español", "start": "https://fullstackopen.com/es/", "hosts": {"fullstackopen.com"}, "max_total_mb": 4096},
-    {"name": "MDN Web Docs - Español e Inglés", "start": "https://developer.mozilla.org/es/", "starts": ["https://developer.mozilla.org/es/", "https://developer.mozilla.org/en-US/"], "hosts": {"developer.mozilla.org"}, "allowed_paths": ["/es/", "/en-US/"], "max_total_mb": 8192},
-    {"name": "Curso Completo de Ciberseguridad - Antinori Ariel", "start": "https://github.com/antinoriariel/curso_ciberseguridad", "hosts": {"github.com"}, "allowed_paths": ["/antinoriariel/curso_ciberseguridad"], "resource_hosts": {"raw.githubusercontent.com"}, "max_total_mb": 4096},
+    {"name": "MDN Web Docs - Español e Inglés", "start": "https://developer.mozilla.org/es/", "starts": ["https://developer.mozilla.org/es/", "https://developer.mozilla.org/en-US/"], "hosts": {"developer.mozilla.org"}, "allowed_paths": ["/es/", "/en-US/"], "max_total_mb": 10000},
+    {"name": "Curso Completo de Ciberseguridad - Antinori Ariel", "start": "https://github.com/antinoriariel/curso_ciberseguridad", "hosts": {"github.com"}, "allowed_paths": ["/antinoriariel/curso_ciberseguridad"], "resource_hosts": {"raw.githubusercontent.com"}, "max_total_mb": 5000},
     
 ]
 
@@ -40,11 +42,16 @@ METADATA = ROOT / "_metadata"
 URL_MAP_FILE = METADATA / "url-map.json"
 PAGE_MAP_FILE = METADATA / "page-map.json"
 
-MAX_PAGES_PER_SITE = 20000
+MAX_PAGES_PER_SITE = 30000
 MAX_DEPTH = 35
 NAVIGATION_TIMEOUT = 45000
-NETWORK_IDLE_TIMEOUT = 5000
-WAIT_AFTER_LOAD_MS = 400
+NETWORK_IDLE_TIMEOUT = 2500
+WAIT_AFTER_LOAD_MS = 300
+PAGE_WORKERS = 6
+NAVIGATION_RETRIES = 2
+MAX_PAGE_ATTEMPTS = 3
+RESOURCE_BODY_RETRIES = 2
+RETRY_DELAY_MS = 800
 LAZY_SCROLL_STEP_MS = 80
 MAX_LAZY_SCROLL_STEPS = 30
 MAX_RESOURCE_SIZE = 700 * 1024 * 1024
@@ -91,6 +98,7 @@ url_to_file = {}
 file_to_url = {}
 page_urls = set()
 asset_urls = set()
+resource_locks = {}
 errors = []
 visited_by_site = {}
 site_storage = {}
@@ -142,22 +150,50 @@ def save_limited_file(path, data, tracker, description="archivo"):
 
 
 def clean_url(url):
+    """Normaliza lo seguro sin alterar parámetros de consulta funcionales.
+
+    Elimina fragmentos, uniforma esquema/host y puertos por defecto, y
+    normaliza la escritura hexadecimal de escapes URL. No elimina parámetros
+    ni cambia mayúsculas de rutas porque algunos sitios distinguen esos valores.
+    """
     if not url:
         return ""
 
     try:
         parts = urlsplit(str(url).strip())
-
-        if parts.scheme.lower() not in ("http", "https"):
+        scheme = parts.scheme.lower()
+        if scheme not in ("http", "https") or not parts.hostname:
             return ""
 
-        return urlunsplit((
-            parts.scheme.lower(),
-            parts.netloc.lower(),
-            parts.path or "/",
-            parts.query,
-            ""
-        ))
+        hostname = parts.hostname.lower()
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+
+        port = parts.port
+        if port and not ((scheme == "http" and port == 80) or
+                         (scheme == "https" and port == 443)):
+            hostname = f"{hostname}:{port}"
+
+        # Conserva userinfo si la URL lo contiene, aunque normalmente no se usa.
+        userinfo = ""
+        if "@" in parts.netloc:
+            userinfo = parts.netloc.rsplit("@", 1)[0] + "@"
+        netloc = userinfo + hostname
+
+        path = parts.path or "/"
+        # Decodifica únicamente caracteres URL no reservados (p. ej. %7E -> ~).
+        def normalize_escape(match):
+            value = int(match.group(1), 16)
+            char = chr(value)
+            if ("A" <= char <= "Z" or "a" <= char <= "z" or
+                    "0" <= char <= "9" or char in "-._~"):
+                return char
+            return "%" + match.group(1).upper()
+
+        path = re.sub(r"%([0-9a-fA-F]{2})", normalize_escape, path)
+        query = re.sub(r"%([0-9a-fA-F]{2})", lambda m: "%" + m.group(1).upper(), parts.query)
+
+        return urlunsplit((scheme, netloc, path, query, ""))
 
     except Exception:
         return ""
@@ -477,87 +513,82 @@ def infer_old_pages():
             )
 
 
-def save_response_resource(response, site, tracker):
+async def save_response_resource(response, site, tracker):
+    """Guarda recursos con bloqueo por URL: una descarga duplicada espera a la
+    primera y, si esta falla, puede intentar guardar su propia respuesta.
+    """
+    url = ""
+
     try:
         if tracker["limite_alcanzado"]:
             return
 
         resource_type = response.request.resource_type
-
         if resource_type in ("document", "websocket"):
             return
-
         if response.status not in (200, 206):
             return
 
         url = clean_url(response.url)
-
         if not url or not is_allowed_resource(url, site):
             return
 
-        # Evita descargar y escribir repetidamente CSS, JS, fuentes e imágenes
-        # compartidos por cientos de páginas.
-        existing_file = url_to_file.get(url)
-        if existing_file and Path(existing_file).is_file():
-            return
-
-        allowed = {
-            "stylesheet",
-            "script",
-            "image",
-            "font",
-            "manifest",
-            "media"
-        }
-
+        allowed = {"stylesheet", "script", "image", "font", "manifest", "media"}
         if resource_type not in allowed:
             return
 
-        headers = response.headers
-        content_type = headers.get("content-type", "")
-        length = headers.get("content-length")
+        # El lock evita que una solicitud duplicada se descarte si la primera falla.
+        lock = resource_locks.setdefault(url, asyncio.Lock())
+        async with lock:
+            existing_file = url_to_file.get(url)
+            if existing_file and Path(existing_file).is_file():
+                return
 
-        if length:
-            try:
-                if int(length) > MAX_RESOURCE_SIZE:
-                    print("Recurso individual demasiado grande:", url)
-                    return
-            except ValueError:
-                pass
+            headers = response.headers
+            content_type = headers.get("content-type", "")
+            length = headers.get("content-length")
+            if length:
+                try:
+                    if int(length) > MAX_RESOURCE_SIZE:
+                        print("Recurso individual demasiado grande:", url)
+                        return
+                except ValueError:
+                    pass
 
-        data = response.body()
+            data = None
+            for body_attempt in range(1, RESOURCE_BODY_RETRIES + 1):
+                try:
+                    data = await response.body()
+                    if data:
+                        break
+                except Exception as body_exc:
+                    if body_attempt >= RESOURCE_BODY_RETRIES:
+                        raise body_exc
+                    await asyncio.sleep(0.25 * body_attempt)
 
-        if not data:
-            return
+            if not data or len(data) > MAX_RESOURCE_SIZE or looks_like_html(data):
+                return
 
-        if len(data) > MAX_RESOURCE_SIZE:
-            print("Recurso individual demasiado grande:", url)
-            return
+            extension = detect_extension(url, content_type, data)
+            path = safe_local_path(url, content_type=content_type)
+            if path.suffix.lower() != extension:
+                path = path.with_suffix(extension)
 
-        if looks_like_html(data):
-            return
+            if not save_limited_file(path, data, tracker, description=url):
+                return
 
-        extension = detect_extension(url, content_type, data)
-        path = safe_local_path(url, content_type=content_type)
-
-        if path.suffix.lower() != extension:
-            path = path.with_suffix(extension)
-
-        if not save_limited_file(path, data, tracker, description=url):
-            return
-
-        register_url(url, path)
-        asset_urls.add(url)
+            register_url(url, path)
+            asset_urls.add(url)
 
     except Exception as exc:
-        errors.append(f"RECURSO | {response.url} | {exc}")
+        errors.append(f"RECURSO | {url or response.url} | {exc}")
 
 
-def extract_page_links(page, current_url, site):
+async def extract_page_links(page, current_url, site):
     results = []
 
     try:
-        elements = page.locator(
+        elements = await page.locator(
             "a[href], area[href], iframe[src], frame[src], "
             "source[src], video[src], audio[src], link[href]"
         ).evaluate_all("""
@@ -583,7 +614,6 @@ def extract_page_links(page, current_url, site):
             if not absolute:
                 continue
 
-            # FILTRO: solo páginas permitidas por el sitio.
             if not is_allowed_page(absolute, site):
                 continue
 
@@ -600,245 +630,316 @@ def is_probable_page(url):
     return extension not in NON_PAGE_EXTENSIONS
 
 
-def crawl_site(browser, site):
+async def crawl_site(browser, site):
     print("\n" + "=" * 65)
     print("SITIO:", site["name"])
     print("INICIO:", site["start"])
     print("LÍMITE TOTAL:", site.get("max_total_mb", 2048), "MB")
     print("LÍMITE POR ARCHIVO:", format_mb(MAX_RESOURCE_SIZE), "MB")
+    print("PÁGINAS SIMULTÁNEAS:", PAGE_WORKERS)
+    print("INTENTOS MÁXIMOS POR PÁGINA:", MAX_PAGE_ATTEMPTS)
     print("=" * 65)
 
     tracker = create_site_tracker(site)
     site_storage[site["name"]] = tracker
 
-    context = browser.new_context(
+    context = await browser.new_context(
         ignore_https_errors=True,
         viewport={"width": 1440, "height": 1000},
         locale="es-ES"
     )
-
     context.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
     context.set_default_timeout(15000)
-
-    context.on(
-        "response",
-        lambda response: save_response_resource(response, site, tracker)
-    )
 
     starts = site.get("starts", [site["start"]])
     initial_urls = list(dict.fromkeys(
         clean_url(url) for url in starts if clean_url(url)
     ))
-    queue = deque((url, 0) for url in initial_urls)
+
+    queue = asyncio.Queue()
+    for url in initial_urls:
+        queue.put_nowait((url, 0, 1))
+
+    # queued = descubiertas alguna vez; in_progress = activas; visited = guardadas.
+    # Una URL solo pasa a visited después de guardar correctamente su HTML.
     queued = set(initial_urls)
+    in_progress = set()
     visited = set()
+    failed_pages = {}
+    retry_count = 0
     pages_saved = 0
+    resource_tasks = set()
 
-    # Reutilizar una sola pestaña evita crear y destruir miles de páginas.
-    page = context.new_page()
+    worker_count = PAGE_WORKERS
+    pages = [await context.new_page() for _ in range(worker_count)]
 
-    while (
-        queue
-        and pages_saved < MAX_PAGES_PER_SITE
-        and not tracker["limite_alcanzado"]
-    ):
-        current_url, depth = queue.popleft()
-        current_url = clean_url(current_url)
+    def attach_resource_listener(page):
+        def on_response(response):
+            task = asyncio.create_task(save_response_resource(response, site, tracker))
+            resource_tasks.add(task)
+            task.add_done_callback(resource_tasks.discard)
+        page.on("response", on_response)
 
-        if not current_url or current_url in visited:
-            continue
+    for page in pages:
+        attach_resource_listener(page)
 
-        if depth > MAX_DEPTH:
-            continue
+    async def worker(worker_id, page):
+        nonlocal pages_saved, retry_count
 
-        # FILTRO: no visitar páginas fuera de las rutas permitidas.
-        if not is_allowed_page(current_url, site):
-            continue
+        while True:
+            item = await queue.get()
+            current_url = ""
+            depth = 0
+            attempt = 1
+            eligible_for_retry = False
+            success = False
+            claimed = False
 
-        if not is_probable_page(current_url):
-            continue
-
-        visited.add(current_url)
-
-        try:
-            print(
-                f"[{site['name']}] "
-                f"({pages_saved + 1}/{MAX_PAGES_PER_SITE}) "
-                f"{current_url}"
-            )
-
-            response = page.goto(
-                current_url,
-                wait_until="domcontentloaded",
-                timeout=NAVIGATION_TIMEOUT
-            )
-
-            if response is None:
-                continue
-
-            if response.status >= 400:
-                errors.append(f"HTTP {response.status} | {current_url}")
-                continue
-
-            # Espera a que terminen las solicitudes de red, pero con un límite
-            # para no quedar atrapado por analítica, anuncios o conexiones persistentes.
             try:
-                page.wait_for_load_state(
-                    "networkidle",
-                    timeout=NETWORK_IDLE_TIMEOUT
+                if item is None:
+                    return
+
+                current_url, depth, attempt = item
+                current_url = clean_url(current_url)
+
+                if not current_url or current_url in visited or current_url in in_progress:
+                    continue
+                if depth > MAX_DEPTH:
+                    continue
+                if pages_saved >= MAX_PAGES_PER_SITE or tracker["limite_alcanzado"]:
+                    continue
+                if not is_allowed_page(current_url, site) or not is_probable_page(current_url):
+                    continue
+
+                # No hay await entre la comprobación y la reserva: evita que dos
+                # trabajadores procesen simultáneamente la misma URL.
+                in_progress.add(current_url)
+                claimed = True
+                eligible_for_retry = True
+
+                print(
+                    f"[{site['name']}] [Trabajador {worker_id}] "
+                    f"({pages_saved + 1}/{MAX_PAGES_PER_SITE}) "
+                    f"Intento {attempt}/{MAX_PAGE_ATTEMPTS}: {current_url}"
                 )
-            except PlaywrightTimeoutError:
-                pass
 
-            # Activa y desplaza únicamente páginas que realmente tengan imágenes
-            # diferidas. Así se conservan imágenes lazy-load sin penalizar cada página.
-            try:
-                lazy_count = page.locator(
-                    'img[loading="lazy"], img[data-src], img[data-lazy-src]'
-                ).count()
+                navigation_timed_out = False
+                response = None
+                previous_page_url = clean_url(page.url)
 
-                if lazy_count:
-                    page.evaluate("""
-                        () => {
-                            document.querySelectorAll(
-                                'img[loading="lazy"], img[data-src], img[data-lazy-src]'
-                            ).forEach(img => {
-                                img.loading = 'eager';
-                                if (!img.src && img.dataset.src) img.src = img.dataset.src;
-                                if (!img.src && img.dataset.lazySrc) img.src = img.dataset.lazySrc;
-                            });
-                        }
-                    """)
+                for nav_attempt in range(1, NAVIGATION_RETRIES + 1):
+                    try:
+                        response = await page.goto(
+                            current_url,
+                            wait_until="domcontentloaded",
+                            timeout=NAVIGATION_TIMEOUT
+                        )
+                    except PlaywrightTimeoutError:
+                        if nav_attempt < NAVIGATION_RETRIES:
+                            await page.wait_for_timeout(RETRY_DELAY_MS)
+                            continue
+                        navigation_timed_out = True
+                        errors.append(f"TIMEOUT NAVEGACIÓN | {current_url}")
+                        response = None
+                        break
 
-                    page.evaluate(
-                        """async (maxSteps, delay) => {
+                    if (
+                        response is not None
+                        and response.status in (429, 500, 502, 503, 504)
+                        and nav_attempt < NAVIGATION_RETRIES
+                    ):
+                        await page.wait_for_timeout(RETRY_DELAY_MS * nav_attempt)
+                        continue
+                    break
+
+                if response is not None and response.status >= 400:
+                    errors.append(f"HTTP {response.status} | {current_url}")
+                    continue
+
+                if response is None:
+                    current_browser_url = clean_url(page.url)
+                    if (
+                        not navigation_timed_out
+                        or current_browser_url in ("", clean_url("about:blank"))
+                        or current_browser_url == previous_page_url
+                    ):
+                        continue
+
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+                except PlaywrightTimeoutError:
+                    pass
+
+                # Activa imágenes diferidas y recorre la página para disparar lazy loading.
+                try:
+                    lazy_count = await page.locator(
+                        'img[loading="lazy"], img[data-src], img[data-lazy-src]'
+                    ).count()
+
+                    if lazy_count:
+                        await page.evaluate("""
+                            () => {
+                                document.querySelectorAll(
+                                    'img[loading="lazy"], img[data-src], img[data-lazy-src]'
+                                ).forEach(img => {
+                                    img.loading = 'eager';
+                                    if (!img.src && img.dataset.src) img.src = img.dataset.src;
+                                    if (!img.src && img.dataset.lazySrc) img.src = img.dataset.lazySrc;
+                                });
+                            }
+                        """)
+                        await page.evaluate("""async (maxSteps, delay) => {
                             const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-                            const height = Math.max(
-                                document.body.scrollHeight,
-                                document.documentElement.scrollHeight
-                            );
+                            const height = Math.max(document.body.scrollHeight,
+                                document.documentElement.scrollHeight);
                             const step = Math.max(window.innerHeight, Math.ceil(height / maxSteps));
-
                             for (let y = 0, n = 0; y < height && n < maxSteps; y += step, n++) {
                                 window.scrollTo(0, y);
                                 await pause(delay);
                             }
-
                             window.scrollTo(0, 0);
-                        }""",
-                        MAX_LAZY_SCROLL_STEPS,
-                        LAZY_SCROLL_STEP_MS
+                        }""", MAX_LAZY_SCROLL_STEPS, LAZY_SCROLL_STEP_MS)
+                        await page.wait_for_timeout(300)
+                    else:
+                        await page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
+                except Exception:
+                    await page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
+
+                try:
+                    await page.locator("details").evaluate_all(
+                        "elements => elements.forEach(el => el.open = true)"
                     )
-                    page.wait_for_timeout(300)
-                else:
-                    page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
-            except Exception:
-                page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
+                except Exception:
+                    pass
 
-            # Abre los desplegables antes de guardar el HTML.
-            try:
-                page.locator("details").evaluate_all(
-                    "elements => elements.forEach(el => el.open = true)"
-                )
-            except Exception:
-                pass
-
-            final_url = clean_url(page.url) or current_url
-
-            # FILTRO: no guardar una página si fue redirigida
-            # a una ruta que no está permitida.
-            if not is_allowed_page(final_url, site):
-                print(
-                    "   Redirección fuera de las rutas permitidas; "
-                    "página omitida:",
-                    final_url
-                )
-                continue
-
-            html = page.content()
-            html_bytes = html.encode("utf-8", errors="replace")
-
-            if not looks_like_html(html_bytes):
-                errors.append(f"NO HTML | {current_url}")
-                continue
-
-            local_file = safe_local_path(
-                final_url,
-                force_html=True,
-                content_type="text/html"
-            )
-
-            if not save_limited_file(
-                local_file,
-                html_bytes,
-                tracker,
-                description=final_url
-            ):
-                break
-
-            register_url(current_url, local_file, is_page=True)
-            register_url(final_url, local_file, is_page=True)
-
-            pages_saved += 1
-
-            print(
-                f"   Almacenamiento: "
-                f"{format_mb(tracker['bytes_guardados'])} / "
-                f"{tracker['limite_mb']} MB"
-            )
-
-            links = extract_page_links(page, final_url, site)
-
-            for link in links:
-                if link in queued or link in visited:
+                final_url = clean_url(page.url) or current_url
+                if not is_allowed_page(final_url, site):
+                    errors.append(f"REDIRECCIÓN FUERA DE RUTA | {current_url} -> {final_url}")
+                    eligible_for_retry = False
                     continue
 
-                if is_probable_page(link):
-                    queue.append((link, depth + 1))
-                    queued.add(link)
+                html = await page.content()
+                html_bytes = html.encode("utf-8", errors="replace")
+                if not looks_like_html(html_bytes):
+                    errors.append(f"NO HTML | {current_url}")
+                    continue
 
-        except PlaywrightTimeoutError:
-            errors.append(f"TIMEOUT | {current_url}")
+                if pages_saved >= MAX_PAGES_PER_SITE or tracker["limite_alcanzado"]:
+                    eligible_for_retry = False
+                    continue
 
-        except Exception as exc:
-            errors.append(f"PAGINA | {current_url} | {exc}")
+                local_file = safe_local_path(
+                    final_url, force_html=True, content_type="text/html"
+                )
+                if not save_limited_file(local_file, html_bytes, tracker, description=final_url):
+                    eligible_for_retry = False
+                    continue
 
-        finally:
+                register_url(current_url, local_file, is_page=True)
+                register_url(final_url, local_file, is_page=True)
+                visited.add(current_url)
+                visited.add(final_url)
+                pages_saved += 1
+                success = True
+
+                print(
+                    f"   Guardada: {pages_saved} | Almacenamiento: "
+                    f"{format_mb(tracker['bytes_guardados'])} / {tracker['limite_mb']} MB"
+                )
+
+                # Una vez guardado el HTML, un fallo al extraer enlaces no debe
+                # provocar que se descargue de nuevo la misma página.
+                links = []
+                for link_attempt in range(1, 3):
+                    links = await extract_page_links(page, final_url, site)
+                    if links:
+                        break
+                    if link_attempt == 1:
+                        await asyncio.sleep(0.2)
+                if not links:
+                    errors.append(f"SIN ENLACES EXTRAÍDOS O PÁGINA SIN ENLACES | {final_url}")
+
+                for link in links:
+                    if link in queued or link in visited or link in in_progress:
+                        continue
+                    if is_probable_page(link):
+                        queued.add(link)
+                        queue.put_nowait((link, depth + 1, 1))
+
+            except PlaywrightTimeoutError:
+                errors.append(f"TIMEOUT | {current_url}")
+            except Exception as exc:
+                errors.append(f"PAGINA | {current_url} | {exc}")
+            finally:
+                if claimed:
+                    in_progress.discard(current_url)
+
+                if eligible_for_retry and not success and current_url:
+                    if attempt < MAX_PAGE_ATTEMPTS and not tracker["limite_alcanzado"]:
+                        retry_count += 1
+                        delay = RETRY_DELAY_MS * attempt
+                        print(
+                            f"   Reintentando página ({attempt + 1}/{MAX_PAGE_ATTEMPTS}) "
+                            f"en {delay} ms: {current_url}"
+                        )
+                        await asyncio.sleep(delay / 1000)
+                        queue.put_nowait((current_url, depth, attempt + 1))
+                    else:
+                        failed_pages[current_url] = attempt
+                        errors.append(
+                            f"PÁGINA FALLIDA DEFINITIVA | intentos={attempt} | {current_url}"
+                        )
+
+                queue.task_done()
+
+    workers = [
+        asyncio.create_task(worker(index + 1, page))
+        for index, page in enumerate(pages)
+    ]
+
+    await queue.join()
+    for _ in workers:
+        queue.put_nowait(None)
+    await asyncio.gather(*workers, return_exceptions=True)
+
+    # Las respuestas pueden seguir generando tareas de guardado después del crawl.
+    while resource_tasks:
+        pending = list(resource_tasks)
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    for page in pages:
+        try:
+            await page.close()
+        except Exception:
             pass
-
-    try:
-        page.close()
-    except Exception:
-        pass
 
     visited_by_site[site["name"]] = {
         "paginas_guardadas": pages_saved,
-        "urls_visitadas": len(visited),
-        "urls_pendientes": len(queue),
+        "urls_descubiertas": len(queued),
+        "paginas_completadas": len(visited),
+        "paginas_fallidas_definitivas": len(failed_pages),
+        "reintentos_de_pagina": retry_count,
+        "detalle_fallidas": failed_pages,
         "almacenamiento_MB": format_mb(tracker["bytes_guardados"]),
         "limite_MB": tracker["limite_mb"],
         "limite_alcanzado": tracker["limite_alcanzado"],
+        "trabajadores_simultaneos": worker_count
     }
 
-    context.close()
+    await context.close()
 
     print("\n" + "-" * 55)
     print("FINALIZADO:", site["name"])
-    print("Páginas:", pages_saved)
-    print(
-        "Almacenamiento:",
-        format_mb(tracker["bytes_guardados"]),
-        "MB de",
-        tracker["limite_mb"],
-        "MB"
-    )
-    print(
-        "Límite alcanzado:",
-        "SÍ" if tracker["limite_alcanzado"] else "NO"
-    )
+    print("Páginas guardadas:", pages_saved)
+    print("URLs descubiertas:", len(queued))
+    print("Páginas fallidas definitivas:", len(failed_pages))
+    print("Reintentos de página:", retry_count)
+    print("Almacenamiento:", format_mb(tracker["bytes_guardados"]), "MB de", tracker["limite_mb"], "MB")
+    print("Límite alcanzado:", "SÍ" if tracker["limite_alcanzado"] else "NO")
     print("-" * 55)
 
 
+@lru_cache(maxsize=500000)
 def find_local_target(url):
     url = clean_url(url)
 
@@ -1186,6 +1287,8 @@ def create_report():
         "tamano_total_MB": round(total_bytes / 1024 / 1024, 2),
         "limite_por_recurso_MB": format_mb(MAX_RESOURCE_SIZE),
         "network_idle_timeout_ms": NETWORK_IDLE_TIMEOUT,
+        "trabajadores_simultaneos": PAGE_WORKERS,
+        "reintentos_navegacion": NAVIGATION_RETRIES,
         "espera_adicional_ms": WAIT_AFTER_LOAD_MS,
         "errores": len(errors),
         "nota": (
@@ -1212,7 +1315,7 @@ def create_report():
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
-def main():
+async def main():
     ROOT.mkdir(parents=True, exist_ok=True)
     METADATA.mkdir(parents=True, exist_ok=True)
 
@@ -1222,20 +1325,21 @@ def main():
     print("MÁXIMO DE PÁGINAS POR SITIO:", MAX_PAGES_PER_SITE)
     print("PROFUNDIDAD MÁXIMA:", MAX_DEPTH)
     print("MÁXIMO POR ARCHIVO:", format_mb(MAX_RESOURCE_SIZE), "MB")
+    print("TRABAJADORES SIMULTÁNEOS:", PAGE_WORKERS)
     print("=" * 65)
 
     load_previous_maps()
     infer_old_pages()
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
 
         try:
             for site in SITES:
-                crawl_site(browser, site)
+                await crawl_site(browser, site)
 
         finally:
-            browser.close()
+            await browser.close()
 
     print("\n===== GUARDANDO MAPAS =====")
     save_maps()
@@ -1258,4 +1362,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
