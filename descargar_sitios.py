@@ -104,6 +104,12 @@ visited_by_site = {}
 site_storage = {}
 mdn_language_stats = {}
 
+# Reservas de rutas para impedir colisiones en sistemas de archivos
+# que no distinguen mayúsculas/minúsculas (Windows y algunos ZIP/artifacts).
+local_path_owners = {}
+path_sanitizations = 0
+path_collisions = 0
+
 
 def create_site_tracker(site):
     limit_mb = site.get("max_total_mb", 4096)
@@ -420,22 +426,101 @@ def detect_extension(url, content_type, data):
     return ".bin"
 
 
+def sanitize_path_component(component):
+    """Convierte un segmento URL en un nombre compatible con Windows/ZIP."""
+    global path_sanitizations
+    original = str(component)
+    value = original
+
+    # Codifica caracteres prohibidos por NTFS y caracteres de control.
+    def replace_forbidden(match):
+        return "_u" + format(ord(match.group(0)), "04X") + "_"
+
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1F]', replace_forbidden, value)
+    # Windows no admite puntos ni espacios al final de un componente.
+    value = value.rstrip(" .")
+    if not value:
+        value = "_"
+
+    # Nombres de dispositivo reservados en Windows, incluso con extensión.
+    stem = value.split(".", 1)[0].upper()
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+    if stem in reserved:
+        value = "_" + value
+
+    # Evita componentes excesivamente largos y conserva una identidad estable.
+    if len(value) > 180:
+        digest = hashlib.sha256(original.encode("utf-8", errors="replace")).hexdigest()[:12]
+        value = value[:160] + "__" + digest
+
+    if value != original:
+        path_sanitizations += 1
+    return value
+
+
+def _path_key(path):
+    """Clave relativa, normalizada y case-insensitive para comparar rutas."""
+    try:
+        relative = Path(path).relative_to(ROOT)
+    except ValueError:
+        relative = Path(path)
+    return relative.as_posix().casefold()
+
+
+def _reserve_path(path, url):
+    """Reserva una ruta. Si colisiona, añade un hash determinista al archivo."""
+    global path_collisions
+    path = Path(path)
+    key = _path_key(path)
+    owner = local_path_owners.get(key)
+
+    if owner is None and not path.exists():
+        local_path_owners[key] = url
+        return path
+    if owner == url:
+        return path
+
+    # Si existe físicamente pero no conocemos su URL, tampoco la sobrescribimos.
+    digest = hashlib.sha256(url.encode("utf-8", errors="replace")).hexdigest()[:12]
+    candidate = path.with_name(path.stem + "__" + digest + path.suffix)
+    candidate_key = _path_key(candidate)
+    counter = 1
+    while ((candidate_key in local_path_owners and local_path_owners[candidate_key] != url)
+           or (candidate.exists() and local_path_owners.get(candidate_key) != url)):
+        candidate = path.with_name(path.stem + "__" + digest + "_" + str(counter) + path.suffix)
+        candidate_key = _path_key(candidate)
+        counter += 1
+
+    local_path_owners[candidate_key] = url
+    path_collisions += 1
+    print(f"[RUTA EN COLISIÓN] {path} -> {candidate}")
+    return candidate
+
+
 def safe_local_path(url, force_html=False, content_type=None):
     parts = urlsplit(url)
+    normalized_url = clean_url(url) or str(url)
+
+    # Si esta URL ya tiene una ubicación registrada, se conserva exactamente.
+    existing = url_to_file.get(normalized_url)
+    if existing and Path(existing).exists():
+        return Path(existing)
+
     host = parts.hostname or "desconocido"
     web_path = unquote(parts.path or "/")
-
     if web_path.endswith("/"):
         web_path += "index"
 
-    relative = Path(host) / web_path.lstrip("/")
+    raw_parts = [host] + [part for part in web_path.lstrip("/").split("/") if part]
+    safe_parts = [sanitize_path_component(part) for part in raw_parts]
+    relative = Path(*safe_parts)
+
     mime = (content_type or "").split(";")[0].strip().lower()
     suffix = relative.suffix.lower()
 
     if force_html or mime in HTML_MIME:
         if suffix in ("", ".bin", ".php", ".asp", ".aspx", ".jsp"):
             relative = relative.with_suffix(".html")
-
     elif not suffix:
         extension = MIME_EXTENSIONS.get(mime, ".bin")
         relative = relative.with_suffix(extension)
@@ -445,7 +530,7 @@ def safe_local_path(url, force_html=False, content_type=None):
             relative.stem + query_suffix(parts.query) + relative.suffix
         )
 
-    return ROOT / relative
+    return _reserve_path(ROOT / relative, normalized_url)
 
 
 def register_url(url, path, is_page=False):
@@ -456,7 +541,11 @@ def register_url(url, path, is_page=False):
 
     path = Path(path)
     url_to_file[url] = path
-    file_to_url[str(path)] = url
+    # Una ruta local puede representar varios alias (por ejemplo, una página
+    # inglesa que apunta a su traducción española). No sobrescribir el URL
+    # canónico utilizado para resolver recursos relativos del archivo.
+    file_to_url.setdefault(str(path), url)
+    local_path_owners.setdefault(_path_key(path), url)
 
     if is_page:
         page_urls.add(url)
@@ -591,6 +680,60 @@ def infer_old_pages():
                 html_file,
                 is_page=True
             )
+
+
+def normalize_existing_artifact_paths():
+    """Renombra archivos heredados para eliminar nombres inválidos y colisiones."""
+    global path_collisions
+    if not ROOT.exists():
+        return
+
+    files = sorted((p for p in ROOT.rglob("*") if p.is_file()), key=lambda p: p.as_posix().casefold())
+    seen = {}
+    rebuilt_owners = {}
+    renamed = 0
+
+    for old_path in files:
+        try:
+            relative = old_path.relative_to(ROOT)
+        except ValueError:
+            continue
+
+        safe_relative = Path(*(sanitize_path_component(part) for part in relative.parts))
+        target = ROOT / safe_relative
+        key = safe_relative.as_posix().casefold()
+        old_owner = file_to_url.get(str(old_path), "legacy:" + relative.as_posix())
+
+        collision = key in seen and seen[key] != safe_relative.as_posix()
+        collision = collision or (target.exists() and target != old_path)
+        if collision:
+            digest = hashlib.sha256((old_owner + "|" + relative.as_posix()).encode("utf-8", errors="replace")).hexdigest()[:12]
+            target = target.with_name(target.stem + "__" + digest + target.suffix)
+            key = target.relative_to(ROOT).as_posix().casefold()
+            counter = 1
+            while key in seen or (target.exists() and target != old_path):
+                target = target.with_name(target.stem + "_" + str(counter) + target.suffix)
+                key = target.relative_to(ROOT).as_posix().casefold()
+                counter += 1
+            path_collisions += 1
+
+        if target != old_path:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            old_path.rename(target)
+            renamed += 1
+            for mapped_url, mapped_path in list(url_to_file.items()):
+                if Path(mapped_path) == old_path:
+                    url_to_file[mapped_url] = target
+            if str(old_path) in file_to_url:
+                file_to_url[str(target)] = file_to_url.pop(str(old_path))
+
+        seen[key] = target.relative_to(ROOT).as_posix()
+        rebuilt_owners[key] = old_owner
+
+    local_path_owners.clear()
+    local_path_owners.update(rebuilt_owners)
+    if renamed:
+        print(f"Rutas heredadas normalizadas: {renamed}")
 
 
 async def save_response_resource(response, site, tracker):
@@ -1373,6 +1516,48 @@ a{color:#145db8;font-weight:bold}
     )
 
 
+
+def audit_artifact_paths():
+    """Comprueba que ninguna ruta final viole las restricciones del artifact."""
+    forbidden = set('"<>:|?*')
+    invalid = []
+    seen = {}
+    collisions = []
+
+    if not ROOT.exists():
+        return {"rutas_invalidas": invalid, "colisiones_case_insensitive": collisions}
+
+    for path in ROOT.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            relative = path.relative_to(ROOT)
+        except ValueError:
+            continue
+
+        text_path = relative.as_posix()
+        bad = any(ch in forbidden or ord(ch) < 32 for ch in text_path)
+        bad = bad or any(part.endswith((" ", ".")) for part in relative.parts)
+        reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+        bad = bad or any(part.split(".", 1)[0].upper() in reserved for part in relative.parts)
+        if bad:
+            invalid.append(text_path)
+
+        key = text_path.casefold()
+        previous = seen.get(key)
+        if previous and previous != text_path:
+            collisions.append([previous, text_path])
+        else:
+            seen[key] = text_path
+
+    if invalid:
+        errors.append("RUTAS NO COMPATIBLES CON ARTIFACT | " + " | ".join(invalid[:50]))
+    if collisions:
+        errors.append("COLISIONES CASE-INSENSITIVE | " + " | ".join(" <> ".join(x) for x in collisions[:50]))
+
+    print("Auditoría de rutas:", len(invalid), "inválidas;", len(collisions), "colisiones por mayúsculas/minúsculas")
+    return {"rutas_invalidas": invalid, "colisiones_case_insensitive": collisions}
+
 def create_report():
     files = [
         p for p in ROOT.rglob("*")
@@ -1423,6 +1608,8 @@ def create_report():
         "reintentos_navegacion": NAVIGATION_RETRIES,
         "espera_adicional_ms": WAIT_AFTER_LOAD_MS,
         "errores": len(errors),
+        "rutas_sanitizadas": path_sanitizations,
+        "colisiones_de_ruta_resueltas": path_collisions,
         "nota": (
             "Los límites por sitio contabilizan los archivos guardados "
             "durante esta ejecución. El tamaño total de la carpeta salida "
@@ -1465,6 +1652,7 @@ async def main():
 
     load_previous_maps()
     infer_old_pages()
+    normalize_existing_artifact_paths()
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
@@ -1489,6 +1677,9 @@ async def main():
     create_offline_index()
 
     save_maps()
+
+    print("\n===== AUDITANDO RUTAS DEL ARTEFACTO =====")
+    audit_artifact_paths()
 
     print("\n===== GENERANDO INFORME =====")
     create_report()
