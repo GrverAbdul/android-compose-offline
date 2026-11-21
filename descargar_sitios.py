@@ -19,7 +19,7 @@ SITES = [
     #{"name": "GameCode", "start": "https://gamecode.me/", "hosts": {"gamecode.me"}, "resource_hosts": {"assets.gamecode.me", "cdn.jsdelivr.net", "raw.githubusercontent.com"}, "max_total_mb": 4096},
     #{"name": "Aprende Web desde Cero", "start": "https://cacg-code.github.io/web-desde-cero/", "hosts": {"cacg-code.github.io"}, "resource_hosts": {"cdn.jsdelivr.net"}, "max_total_mb": 4096},
     #{"name": "Curso Linux Ciberaula", "start": "https://linux.ciberaula.com/curso/", "hosts": {"linux.ciberaula.com", "www.linux.ciberaula.com"}, "max_total_mb": 4096},
-    {"name": "Tutoriales Programacion Ya", "start": "https://www.tutorialesprogramacionya.com/", "hosts": {"www.tutorialesprogramacionya.com", "tutorialesprogramacionya.com"}, "max_total_mb": 4096},
+    {"name": "Tutoriales Programacion Ya", "start": "https://www.tutorialesprogramacionya.com/", "hosts": {"www.tutorialesprogramacionya.com", "tutorialesprogramacionya.com"}, "max_total_mb": 10000},
     #{"name": "Aprende JavaScript", "start": "https://www.aprendejavascript.dev/", "hosts": {"www.aprendejavascript.dev", "aprendejavascript.dev"}, "max_total_mb": 4096},
     #{"name": "Programa de Ciberseguridad Moderna", "start": "https://vladimiracunadev-create.github.io/modern-cybersecurity-program/", "hosts": {"vladimiracunadev-create.github.io"}, "max_total_mb": 4096},
     #{"name": "Apuntes DAM", "start": "https://apuntes-dam.github.io/apuntes-lenguajes/", "hosts": {"apuntes-dam.github.io"}, "max_total_mb": 4096},
@@ -42,7 +42,7 @@ METADATA = ROOT / "_metadata"
 URL_MAP_FILE = METADATA / "url-map.json"
 PAGE_MAP_FILE = METADATA / "page-map.json"
 
-MAX_PAGES_PER_SITE = 30000
+MAX_PAGES_PER_SITE = 50000
 MAX_DEPTH = 35
 NAVIGATION_TIMEOUT = 45000
 NETWORK_IDLE_TIMEOUT = 2500
