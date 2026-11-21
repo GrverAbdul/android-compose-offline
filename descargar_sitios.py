@@ -34,6 +34,7 @@ SITES = [
     #{"name": "Full Stack Open Español", "start": "https://fullstackopen.com/es/", "hosts": {"fullstackopen.com"}, "max_total_mb": 4096},
     #{"name": "MDN Web Docs - Español e Inglés", "start": "https://developer.mozilla.org/es/", "starts": ["https://developer.mozilla.org/es/", "https://developer.mozilla.org/en-US/"], "hosts": {"developer.mozilla.org"}, "allowed_paths": ["/es/", "/en-US/"], "max_total_mb": 10000},
     {"name": "Curso Completo de Ciberseguridad - Antinori Ariel", "start": "https://github.com/antinoriariel/curso_ciberseguridad", "hosts": {"github.com"}, "allowed_paths": ["/antinoriariel/curso_ciberseguridad"], "resource_hosts": {"raw.githubusercontent.com"}, "max_total_mb": 5000},
+    {"name": "Curso Completo de Ciberseguridad - Antinori Ariel","start": "https://github.com/antinoriariel/curso_ciberseguridad","hosts": {"github.com"},"allowed_paths": ["/antinoriariel/curso_ciberseguridad"],"exclude_paths": ["/antinoriariel/curso_ciberseguridad/compare/"],"resource_hosts": {"raw.githubusercontent.com"},"max_total_mb": 5000},
     
 ]
 
