@@ -19,7 +19,7 @@ SITES = [
     #{"name": "GameCode", "start": "https://gamecode.me/", "hosts": {"gamecode.me"}, "resource_hosts": {"assets.gamecode.me", "cdn.jsdelivr.net", "raw.githubusercontent.com"}, "max_total_mb": 4096},
     #{"name": "Aprende Web desde Cero", "start": "https://cacg-code.github.io/web-desde-cero/", "hosts": {"cacg-code.github.io"}, "resource_hosts": {"cdn.jsdelivr.net"}, "max_total_mb": 4096},
     #{"name": "Curso Linux Ciberaula", "start": "https://linux.ciberaula.com/curso/", "hosts": {"linux.ciberaula.com", "www.linux.ciberaula.com"}, "max_total_mb": 4096},
-    {"name": "Tutoriales Programacion Ya", "start": "https://www.tutorialesprogramacionya.com/", "hosts": {"www.tutorialesprogramacionya.com", "tutorialesprogramacionya.com"}, "max_total_mb": 10000},
+    #{"name": "Tutoriales Programacion Ya", "start": "https://www.tutorialesprogramacionya.com/", "hosts": {"www.tutorialesprogramacionya.com", "tutorialesprogramacionya.com"}, "max_total_mb": 4096},
     #{"name": "Aprende JavaScript", "start": "https://www.aprendejavascript.dev/", "hosts": {"www.aprendejavascript.dev", "aprendejavascript.dev"}, "max_total_mb": 4096},
     #{"name": "Programa de Ciberseguridad Moderna", "start": "https://vladimiracunadev-create.github.io/modern-cybersecurity-program/", "hosts": {"vladimiracunadev-create.github.io"}, "max_total_mb": 4096},
     #{"name": "Apuntes DAM", "start": "https://apuntes-dam.github.io/apuntes-lenguajes/", "hosts": {"apuntes-dam.github.io"}, "max_total_mb": 4096},
@@ -32,9 +32,8 @@ SITES = [
     #{"name": "Duobi Cursos", "start": "https://www.duobi.tech/cursos", "hosts": {"www.duobi.tech"}, "max_total_mb": 4096},
     #{"name": "Pro Git Español", "start": "https://git-scm.com/book/es/v2", "hosts": {"git-scm.com"}, "max_total_mb": 4096},
     #{"name": "Full Stack Open Español", "start": "https://fullstackopen.com/es/", "hosts": {"fullstackopen.com"}, "max_total_mb": 4096},
-    #{"name": "MDN Web Docs - Español e Inglés", "start": "https://developer.mozilla.org/es/", "starts": ["https://developer.mozilla.org/es/", "https://developer.mozilla.org/en-US/"], "hosts": {"developer.mozilla.org"}, "allowed_paths": ["/es/", "/en-US/"], "max_total_mb": 10000},
+    {"name": "MDN Web Docs - Español prioritario + inglés complementario", "start": "https://developer.mozilla.org/es/", "starts": ["https://developer.mozilla.org/es/", "https://developer.mozilla.org/en-US/"], "hosts": {"developer.mozilla.org"}, "allowed_paths": ["/es/", "/en-US/"], "exclude_paths": ["/en-US/play"], "language_strategy": "mdn_es_then_en", "max_total_mb": 10000},
     #{"name": "Curso Completo de Ciberseguridad - Antinori Ariel", "start": "https://github.com/antinoriariel/curso_ciberseguridad", "hosts": {"github.com"}, "allowed_paths": ["/antinoriariel/curso_ciberseguridad"], "resource_hosts": {"raw.githubusercontent.com"}, "max_total_mb": 5000},
-    {"name": "Curso Completo de Ciberseguridad - Antinori Ariel","start": "https://github.com/antinoriariel/curso_ciberseguridad","hosts": {"github.com"},"allowed_paths": ["/antinoriariel/curso_ciberseguridad"],"exclude_paths": ["/antinoriariel/curso_ciberseguridad/compare/"],"resource_hosts": {"raw.githubusercontent.com"},"max_total_mb": 5000},
     
 ]
 
@@ -100,11 +99,16 @@ file_to_url = {}
 page_urls = set()
 asset_urls = set()
 resource_locks = {}
-# Controla rutas locales para evitar colisiones (incluidas las diferencias de mayúsculas).
-local_path_owners = {}
 errors = []
 visited_by_site = {}
 site_storage = {}
+mdn_language_stats = {}
+
+# Reservas de rutas para impedir colisiones en sistemas de archivos
+# que no distinguen mayúsculas/minúsculas (Windows y algunos ZIP/artifacts).
+local_path_owners = {}
+path_sanitizations = 0
+path_collisions = 0
 
 
 def create_site_tracker(site):
@@ -210,32 +214,119 @@ def is_internal(url, site):
 
 
 def is_allowed_page(url, site):
-    """Aplica host, rutas permitidas y exclusiones configuradas para cada sitio."""
+    """
+    Comprueba si una URL puede descargarse como página HTML.
+
+    Si el sitio tiene allowed_paths, solamente permite las rutas
+    que coincidan con esos prefijos.
+
+    Para eLearner se permite /es/, pero se excluyen las demás
+    versiones lingüísticas.
+    """
+
     if not is_internal(url, site):
         return False
 
     try:
         path = urlsplit(url).path or "/"
-
-        # Las exclusiones se evalúan primero y funcionan incluso si no hay
-        # allowed_paths configurado. La coincidencia respeta límites de segmento.
-        for prefix in site.get("exclude_paths", []):
-            prefix = str(prefix).rstrip("/") or "/"
-            if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
+        for excluded in site.get("exclude_paths", []):
+            excluded = excluded.rstrip("/") or "/"
+            if path == excluded or path.startswith(excluded + "/"):
                 return False
+    except Exception:
+        return False
 
-        allowed_paths = site.get("allowed_paths")
-        if not allowed_paths:
-            return True
+    allowed_paths = site.get("allowed_paths")
+
+    if not allowed_paths:
+        return True
+
+    try:
+        path = urlsplit(url).path or "/"
 
         for prefix in allowed_paths:
-            prefix = str(prefix).rstrip("/") or "/"
-            if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
+            prefix = prefix.rstrip("/") or "/"
+
+            if prefix == "/":
+                return True
+
+            if path == prefix or path.startswith(prefix + "/"):
                 return True
 
         return False
+
     except Exception:
         return False
+
+
+def mdn_spanish_counterpart(english_url, html=""):
+    """Encuentra la traducción es anunciada por MDN o deriva su ruta equivalente."""
+    try:
+        parts = urlsplit(clean_url(english_url))
+        if parts.hostname != "developer.mozilla.org":
+            return None
+        path = parts.path or "/"
+        if path == "/en-US/":
+            return "https://developer.mozilla.org/es/"
+        if not path.startswith("/en-US/docs/"):
+            return None
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+            for link in soup.find_all("link", href=True):
+                rel = link.get("rel", [])
+                rel = [str(x).lower() for x in (rel if isinstance(rel, list) else [rel])]
+                hreflang = str(link.get("hreflang", "")).lower()
+                if "alternate" in rel and hreflang in ("es", "es-es", "es-mx"):
+                    candidate = clean_url(urljoin(english_url, link["href"]))
+                    cp = urlsplit(candidate)
+                    if cp.hostname == "developer.mozilla.org" and cp.path.startswith("/es/docs/"):
+                        return urlunsplit((cp.scheme, cp.netloc, cp.path, "", ""))
+        spanish_path = "/es/docs/" + path[len("/en-US/docs/"):]
+        return urlunsplit((parts.scheme, parts.netloc, spanish_path, "", ""))
+    except Exception:
+        return None
+
+
+async def mdn_translation_status(context, spanish_url, cache, locks):
+    """True=traducción española confirmada; False=no existe; None=no verificable."""
+    spanish_url = clean_url(spanish_url)
+    if not spanish_url:
+        return None
+    if spanish_url in cache:
+        return cache[spanish_url]
+    lock = locks.setdefault(spanish_url, asyncio.Lock())
+    async with lock:
+        if spanish_url in cache:
+            return cache[spanish_url]
+        result = None
+        for attempt in range(1, 3):
+            try:
+                response = await context.request.get(
+                    spanish_url, timeout=NAVIGATION_TIMEOUT,
+                    headers={"Accept-Language": "es-ES,es;q=0.9"}
+                )
+                status = response.status
+                if status in (404, 410):
+                    result = False
+                    break
+                if status == 200:
+                    body = await response.text()
+                    soup = BeautifulSoup(body, "html.parser")
+                    lang = str(soup.html.get("lang", "")).lower() if soup.html else ""
+                    final_parts = urlsplit(clean_url(response.url))
+                    title = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
+                    missing = any(x in title for x in ("page not found", "página no encontrada", "404"))
+                    result = bool(lang.startswith("es") and final_parts.path.startswith("/es/") and not missing)
+                    break
+                if status < 500 and status != 429:
+                    result = False
+                    break
+            except Exception:
+                pass
+            if attempt < 2:
+                await asyncio.sleep(0.5 * attempt)
+        cache[spanish_url] = result
+        return result
 
 
 def is_allowed_resource(url, site):
@@ -335,71 +426,101 @@ def detect_extension(url, content_type, data):
     return ".bin"
 
 
-def sanitize_path_component(value, max_length=150):
-    """Convierte un componente URL en un nombre compatible con Windows y ZIP."""
-    value = str(value)
-    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
+def sanitize_path_component(component):
+    """Convierte un segmento URL en un nombre compatible con Windows/ZIP."""
+    global path_sanitizations
+    original = str(component)
+    value = original
+
+    # Codifica caracteres prohibidos por NTFS y caracteres de control.
+    def replace_forbidden(match):
+        return "_u" + format(ord(match.group(0)), "04X") + "_"
+
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1F]', replace_forbidden, value)
+    # Windows no admite puntos ni espacios al final de un componente.
     value = value.rstrip(" .")
-    if value in ("", ".", ".."):
+    if not value:
         value = "_"
 
-    # Windows reserva estos nombres incluso cuando llevan extensión.
+    # Nombres de dispositivo reservados en Windows, incluso con extensión.
     stem = value.split(".", 1)[0].upper()
-    reserved = {"CON", "PRN", "AUX", "NUL"}
-    reserved.update(f"COM{i}" for i in range(1, 10))
-    reserved.update(f"LPT{i}" for i in range(1, 10))
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
     if stem in reserved:
         value = "_" + value
 
-    if len(value) > max_length:
-        suffix = Path(value).suffix
-        digest = hashlib.sha1(value.encode("utf-8", errors="replace")).hexdigest()[:10]
-        keep = max(1, max_length - len(suffix) - len(digest) - 2)
-        value = value[:keep] + "__" + digest + suffix
+    # Evita componentes excesivamente largos y conserva una identidad estable.
+    if len(value) > 180:
+        digest = hashlib.sha256(original.encode("utf-8", errors="replace")).hexdigest()[:12]
+        value = value[:160] + "__" + digest
 
+    if value != original:
+        path_sanitizations += 1
     return value
 
 
-def reserve_local_path(url, path):
-    """Reserva una ruta; si otra URL reclama el mismo nombre, agrega hash estable."""
-    url = clean_url(url)
+def _path_key(path):
+    """Clave relativa, normalizada y case-insensitive para comparar rutas."""
+    try:
+        relative = Path(path).relative_to(ROOT)
+    except ValueError:
+        relative = Path(path)
+    return relative.as_posix().casefold()
+
+
+def _reserve_path(path, url):
+    """Reserva una ruta. Si colisiona, añade un hash determinista al archivo."""
+    global path_collisions
     path = Path(path)
-    original = path
-    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
-    counter = 0
+    key = _path_key(path)
+    owner = local_path_owners.get(key)
 
-    while True:
-        key = str(path).replace("\\", "/").casefold()
-        owner = local_path_owners.get(key)
-        occupied_by_other = owner is not None and owner != url
-        occupied_without_map = path.exists() and owner != url
+    if owner is None and not path.exists():
+        local_path_owners[key] = url
+        return path
+    if owner == url:
+        return path
 
-        if not occupied_by_other and not occupied_without_map:
-            local_path_owners[key] = url
-            return path
-
+    # Si existe físicamente pero no conocemos su URL, tampoco la sobrescribimos.
+    digest = hashlib.sha256(url.encode("utf-8", errors="replace")).hexdigest()[:12]
+    candidate = path.with_name(path.stem + "__" + digest + path.suffix)
+    candidate_key = _path_key(candidate)
+    counter = 1
+    while ((candidate_key in local_path_owners and local_path_owners[candidate_key] != url)
+           or (candidate.exists() and local_path_owners.get(candidate_key) != url)):
+        candidate = path.with_name(path.stem + "__" + digest + "_" + str(counter) + path.suffix)
+        candidate_key = _path_key(candidate)
         counter += 1
-        marker = "__" + digest + (f"_{counter}" if counter > 1 else "")
-        path = original.with_name(original.stem + marker + original.suffix)
+
+    local_path_owners[candidate_key] = url
+    path_collisions += 1
+    print(f"[RUTA EN COLISIÓN] {path} -> {candidate}")
+    return candidate
 
 
 def safe_local_path(url, force_html=False, content_type=None):
     parts = urlsplit(url)
-    host = sanitize_path_component(parts.hostname or "desconocido", 150)
-    web_path = unquote(parts.path or "/")
+    normalized_url = clean_url(url) or str(url)
 
+    # Si esta URL ya tiene una ubicación registrada, se conserva exactamente.
+    existing = url_to_file.get(normalized_url)
+    if existing and Path(existing).exists():
+        return Path(existing)
+
+    host = parts.hostname or "desconocido"
+    web_path = unquote(parts.path or "/")
     if web_path.endswith("/"):
         web_path += "index"
 
-    components = [sanitize_path_component(part) for part in web_path.lstrip("/").split("/") if part]
-    relative = Path(host).joinpath(*components) if components else Path(host) / "index"
+    raw_parts = [host] + [part for part in web_path.lstrip("/").split("/") if part]
+    safe_parts = [sanitize_path_component(part) for part in raw_parts]
+    relative = Path(*safe_parts)
+
     mime = (content_type or "").split(";")[0].strip().lower()
     suffix = relative.suffix.lower()
 
     if force_html or mime in HTML_MIME:
         if suffix in ("", ".bin", ".php", ".asp", ".aspx", ".jsp"):
             relative = relative.with_suffix(".html")
-
     elif not suffix:
         extension = MIME_EXTENSIONS.get(mime, ".bin")
         relative = relative.with_suffix(extension)
@@ -409,7 +530,7 @@ def safe_local_path(url, force_html=False, content_type=None):
             relative.stem + query_suffix(parts.query) + relative.suffix
         )
 
-    return reserve_local_path(url, ROOT / relative)
+    return _reserve_path(ROOT / relative, normalized_url)
 
 
 def register_url(url, path, is_page=False):
@@ -420,101 +541,15 @@ def register_url(url, path, is_page=False):
 
     path = Path(path)
     url_to_file[url] = path
-    file_to_url[str(path)] = url
-    local_path_owners[str(path).replace("\\", "/").casefold()] = url
+    # Una ruta local puede representar varios alias (por ejemplo, una página
+    # inglesa que apunta a su traducción española). No sobrescribir el URL
+    # canónico utilizado para resolver recursos relativos del archivo.
+    file_to_url.setdefault(str(path), url)
+    local_path_owners.setdefault(_path_key(path), url)
 
     if is_page:
         page_urls.add(url)
 
-
-
-def normalize_existing_paths():
-    """Renombra archivos/carpetas antiguos con nombres no portables y actualiza mapas."""
-    if not ROOT.exists():
-        return
-
-    # Primero archivos y luego directorios, desde las rutas más profundas.
-    entries = sorted(
-        [item for item in ROOT.rglob("*") if item != ROOT],
-        key=lambda item: len(item.parts),
-        reverse=True
-    )
-    moved = {}
-
-    for old in entries:
-        if not old.exists():
-            continue
-        safe_name = sanitize_path_component(old.name)
-        if safe_name == old.name:
-            continue
-        new = old.with_name(safe_name)
-        if new.exists():
-            digest = hashlib.sha1(str(old).encode("utf-8")).hexdigest()[:10]
-            new = old.with_name(old.stem + "__" + digest + old.suffix)
-        try:
-            old.rename(new)
-            moved[str(old)] = new
-            print("Ruta anterior normalizada:", old, "->", new)
-        except Exception as exc:
-            errors.append(f"NORMALIZAR RUTA | {old} | {exc}")
-
-    if moved:
-        for url, path in list(url_to_file.items()):
-            old_text = str(path)
-            replacement = moved.get(old_text)
-            if replacement is None:
-                # Si se movió un directorio padre, reconstruye la ruta relativa.
-                for old_text_key, new_path in moved.items():
-                    try:
-                        relative = Path(old_text).relative_to(Path(old_text_key))
-                        replacement = new_path / relative
-                        break
-                    except ValueError:
-                        continue
-            if replacement is not None:
-                url_to_file[url] = replacement
-
-        file_to_url.clear()
-        local_path_owners.clear()
-        for url, path in url_to_file.items():
-            if path.exists():
-                file_to_url[str(path)] = url
-                local_path_owners[str(path).replace("\\", "/").casefold()] = url
-
-
-def audit_artifact_paths():
-    """Comprueba nombres inválidos y colisiones case-insensitive antes del artefacto."""
-    invalid = []
-    collisions = {}
-    seen = {}
-    forbidden = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-    reserved = {"CON", "PRN", "AUX", "NUL"}
-    reserved.update(f"COM{i}" for i in range(1, 10))
-    reserved.update(f"LPT{i}" for i in range(1, 10))
-
-    for item in ROOT.rglob("*"):
-        relative = item.relative_to(ROOT)
-        for component in relative.parts:
-            component_stem = component.split(".", 1)[0].upper()
-            if (forbidden.search(component) or component.endswith((" ", "."))
-                    or component in ("", ".", "..") or component_stem in reserved):
-                invalid.append(str(relative))
-                break
-        key = str(relative).replace("\\", "/").casefold()
-        if key in seen and seen[key] != str(relative):
-            collisions.setdefault(key, [seen[key]]).append(str(relative))
-        else:
-            seen[key] = str(relative)
-
-    print("Auditoría de rutas: archivos/carpetas inválidos =", len(invalid),
-          "| colisiones =", len(collisions))
-    if invalid:
-        for item in invalid[:30]:
-            errors.append(f"RUTA NO PORTABLE | {item}")
-    if collisions:
-        for key, paths in collisions.items():
-            errors.append(f"COLISIÓN DE RUTA | {key} | {paths}")
-    return not invalid and not collisions
 
 def save_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -647,6 +682,60 @@ def infer_old_pages():
             )
 
 
+def normalize_existing_artifact_paths():
+    """Renombra archivos heredados para eliminar nombres inválidos y colisiones."""
+    global path_collisions
+    if not ROOT.exists():
+        return
+
+    files = sorted((p for p in ROOT.rglob("*") if p.is_file()), key=lambda p: p.as_posix().casefold())
+    seen = {}
+    rebuilt_owners = {}
+    renamed = 0
+
+    for old_path in files:
+        try:
+            relative = old_path.relative_to(ROOT)
+        except ValueError:
+            continue
+
+        safe_relative = Path(*(sanitize_path_component(part) for part in relative.parts))
+        target = ROOT / safe_relative
+        key = safe_relative.as_posix().casefold()
+        old_owner = file_to_url.get(str(old_path), "legacy:" + relative.as_posix())
+
+        collision = key in seen and seen[key] != safe_relative.as_posix()
+        collision = collision or (target.exists() and target != old_path)
+        if collision:
+            digest = hashlib.sha256((old_owner + "|" + relative.as_posix()).encode("utf-8", errors="replace")).hexdigest()[:12]
+            target = target.with_name(target.stem + "__" + digest + target.suffix)
+            key = target.relative_to(ROOT).as_posix().casefold()
+            counter = 1
+            while key in seen or (target.exists() and target != old_path):
+                target = target.with_name(target.stem + "_" + str(counter) + target.suffix)
+                key = target.relative_to(ROOT).as_posix().casefold()
+                counter += 1
+            path_collisions += 1
+
+        if target != old_path:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            old_path.rename(target)
+            renamed += 1
+            for mapped_url, mapped_path in list(url_to_file.items()):
+                if Path(mapped_path) == old_path:
+                    url_to_file[mapped_url] = target
+            if str(old_path) in file_to_url:
+                file_to_url[str(target)] = file_to_url.pop(str(old_path))
+
+        seen[key] = target.relative_to(ROOT).as_posix()
+        rebuilt_owners[key] = old_owner
+
+    local_path_owners.clear()
+    local_path_owners.update(rebuilt_owners)
+    if renamed:
+        print(f"Rutas heredadas normalizadas: {renamed}")
+
+
 async def save_response_resource(response, site, tracker):
     """Guarda recursos con bloqueo por URL: una descarga duplicada espera a la
     primera y, si esta falla, puede intentar guardar su propia respuesta.
@@ -706,7 +795,7 @@ async def save_response_resource(response, site, tracker):
             extension = detect_extension(url, content_type, data)
             path = safe_local_path(url, content_type=content_type)
             if path.suffix.lower() != extension:
-                path = reserve_local_path(url, path.with_suffix(extension))
+                path = path.with_suffix(extension)
 
             if not save_limited_file(path, data, tracker, description=url):
                 return
@@ -802,6 +891,13 @@ async def crawl_site(browser, site):
     failed_pages = {}
     retry_count = 0
     pages_saved = 0
+    pages_processed = 0
+    mdn_translation_cache = {}
+    mdn_translation_locks = {}
+    mdn_english_skipped = 0
+    mdn_english_saved = 0
+    mdn_translation_unknown = 0
+    mdn_aliases = []
     resource_tasks = set()
 
     worker_count = PAGE_WORKERS
@@ -818,7 +914,8 @@ async def crawl_site(browser, site):
         attach_resource_listener(page)
 
     async def worker(worker_id, page):
-        nonlocal pages_saved, retry_count
+        nonlocal pages_saved, pages_processed, retry_count
+        nonlocal mdn_english_skipped, mdn_english_saved, mdn_translation_unknown
 
         while True:
             item = await queue.get()
@@ -840,7 +937,7 @@ async def crawl_site(browser, site):
                     continue
                 if depth > MAX_DEPTH:
                     continue
-                if pages_saved >= MAX_PAGES_PER_SITE or tracker["limite_alcanzado"]:
+                if pages_processed >= MAX_PAGES_PER_SITE or tracker["limite_alcanzado"]:
                     continue
                 if not is_allowed_page(current_url, site) or not is_probable_page(current_url):
                     continue
@@ -853,7 +950,7 @@ async def crawl_site(browser, site):
 
                 print(
                     f"[{site['name']}] [Trabajador {worker_id}] "
-                    f"({pages_saved + 1}/{MAX_PAGES_PER_SITE}) "
+                    f"({pages_processed + 1}/{MAX_PAGES_PER_SITE}) "
                     f"Intento {attempt}/{MAX_PAGE_ATTEMPTS}: {current_url}"
                 )
 
@@ -958,28 +1055,55 @@ async def crawl_site(browser, site):
                     errors.append(f"NO HTML | {current_url}")
                     continue
 
-                if pages_saved >= MAX_PAGES_PER_SITE or tracker["limite_alcanzado"]:
+                if pages_processed >= MAX_PAGES_PER_SITE or tracker["limite_alcanzado"]:
                     eligible_for_retry = False
                     continue
 
-                local_file = safe_local_path(
-                    final_url, force_html=True, content_type="text/html"
-                )
-                if not save_limited_file(local_file, html_bytes, tracker, description=final_url):
-                    eligible_for_retry = False
-                    continue
+                # MDN: español tiene prioridad; solo se guarda inglés si no hay traducción.
+                store_page = True
+                spanish_counterpart = None
+                if site.get("language_strategy") == "mdn_es_then_en":
+                    final_parts = urlsplit(final_url)
+                    if final_parts.path.startswith("/en-US/docs/") or final_parts.path == "/en-US/":
+                        spanish_counterpart = mdn_spanish_counterpart(final_url, html)
+                        if spanish_counterpart:
+                            translation_exists = await mdn_translation_status(
+                                context, spanish_counterpart,
+                                mdn_translation_cache, mdn_translation_locks
+                            )
+                            if translation_exists is True:
+                                store_page = False
+                                mdn_english_skipped += 1
+                                mdn_aliases.append((current_url, spanish_counterpart))
+                                if spanish_counterpart not in queued and spanish_counterpart not in visited and spanish_counterpart not in in_progress:
+                                    queued.add(spanish_counterpart)
+                                    queue.put_nowait((spanish_counterpart, depth + 1, 1))
+                                print(f"   Inglés omitido: existe versión española -> {spanish_counterpart}")
+                            elif translation_exists is None:
+                                mdn_translation_unknown += 1
+                                errors.append(f"TRADUCCIÓN MDN NO VERIFICADA; se conserva inglés | {final_url} | {spanish_counterpart}")
 
-                register_url(current_url, local_file, is_page=True)
-                register_url(final_url, local_file, is_page=True)
+                if store_page:
+                    local_file = safe_local_path(
+                        final_url, force_html=True, content_type="text/html"
+                    )
+                    if not save_limited_file(local_file, html_bytes, tracker, description=final_url):
+                        eligible_for_retry = False
+                        continue
+                    register_url(current_url, local_file, is_page=True)
+                    register_url(final_url, local_file, is_page=True)
+                    pages_saved += 1
+                    if urlsplit(final_url).path.startswith("/en-US/"):
+                        mdn_english_saved += 1
+                    print(
+                        f"   Guardada: {pages_saved} | Almacenamiento: "
+                        f"{format_mb(tracker['bytes_guardados'])} / {tracker['limite_mb']} MB"
+                    )
+
                 visited.add(current_url)
                 visited.add(final_url)
-                pages_saved += 1
+                pages_processed += 1
                 success = True
-
-                print(
-                    f"   Guardada: {pages_saved} | Almacenamiento: "
-                    f"{format_mb(tracker['bytes_guardados'])} / {tracker['limite_mb']} MB"
-                )
 
                 # Una vez guardado el HTML, un fallo al extraer enlaces no debe
                 # provocar que se descargue de nuevo la misma página.
@@ -1047,7 +1171,23 @@ async def crawl_site(browser, site):
         except Exception:
             pass
 
+    # Los enlaces ingleses omitidos se redirigen al archivo local español equivalente.
+    for english_url, spanish_url in mdn_aliases:
+        spanish_file = url_to_file.get(clean_url(spanish_url))
+        if spanish_file and Path(spanish_file).is_file():
+            register_url(english_url, spanish_file, is_page=True)
+
+    if site.get("language_strategy") == "mdn_es_then_en":
+        mdn_language_stats[site["name"]] = {
+            "paginas_inglesas_omitidas_por_traduccion_espanola": mdn_english_skipped,
+            "paginas_inglesas_guardadas_por_no_tener_traduccion": mdn_english_saved,
+            "traducciones_no_verificadas_se_conservo_ingles": mdn_translation_unknown,
+            "equivalencias_detectadas": len(mdn_aliases),
+            "rutas_excluidas": site.get("exclude_paths", [])
+        }
+
     visited_by_site[site["name"]] = {
+        "paginas_procesadas": pages_processed,
         "paginas_guardadas": pages_saved,
         "urls_descubiertas": len(queued),
         "paginas_completadas": len(visited),
@@ -1376,6 +1516,48 @@ a{color:#145db8;font-weight:bold}
     )
 
 
+
+def audit_artifact_paths():
+    """Comprueba que ninguna ruta final viole las restricciones del artifact."""
+    forbidden = set('"<>:|?*')
+    invalid = []
+    seen = {}
+    collisions = []
+
+    if not ROOT.exists():
+        return {"rutas_invalidas": invalid, "colisiones_case_insensitive": collisions}
+
+    for path in ROOT.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            relative = path.relative_to(ROOT)
+        except ValueError:
+            continue
+
+        text_path = relative.as_posix()
+        bad = any(ch in forbidden or ord(ch) < 32 for ch in text_path)
+        bad = bad or any(part.endswith((" ", ".")) for part in relative.parts)
+        reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+        bad = bad or any(part.split(".", 1)[0].upper() in reserved for part in relative.parts)
+        if bad:
+            invalid.append(text_path)
+
+        key = text_path.casefold()
+        previous = seen.get(key)
+        if previous and previous != text_path:
+            collisions.append([previous, text_path])
+        else:
+            seen[key] = text_path
+
+    if invalid:
+        errors.append("RUTAS NO COMPATIBLES CON ARTIFACT | " + " | ".join(invalid[:50]))
+    if collisions:
+        errors.append("COLISIONES CASE-INSENSITIVE | " + " | ".join(" <> ".join(x) for x in collisions[:50]))
+
+    print("Auditoría de rutas:", len(invalid), "inválidas;", len(collisions), "colisiones por mayúsculas/minúsculas")
+    return {"rutas_invalidas": invalid, "colisiones_case_insensitive": collisions}
+
 def create_report():
     files = [
         p for p in ROOT.rglob("*")
@@ -1414,6 +1596,7 @@ def create_report():
         ],
         "almacenamiento_por_sitio": storage_report,
         "paginas_por_sitio": visited_by_site,
+        "seleccion_bilingue_mdn": mdn_language_stats,
         "paginas_en_mapa": len(page_urls),
         "recursos_capturados": len(asset_urls),
         "archivos_generados": len(files),
@@ -1425,10 +1608,15 @@ def create_report():
         "reintentos_navegacion": NAVIGATION_RETRIES,
         "espera_adicional_ms": WAIT_AFTER_LOAD_MS,
         "errores": len(errors),
+        "rutas_sanitizadas": path_sanitizations,
+        "colisiones_de_ruta_resueltas": path_collisions,
         "nota": (
             "Los límites por sitio contabilizan los archivos guardados "
             "durante esta ejecución. El tamaño total de la carpeta salida "
             "también puede incluir archivos de ejecuciones anteriores. "
+            "MDN usa español como idioma prioritario y conserva en inglés "
+            "las páginas /en-US/docs/ cuyo equivalente /es/docs/ no existe. "
+            "Se excluye /en-US/play y se conserva /es/play. "
             "Los contenidos dependientes de APIs, autenticación, streaming "
             "o servidores externos pueden no funcionar completamente "
             "sin conexión."
@@ -1464,7 +1652,7 @@ async def main():
 
     load_previous_maps()
     infer_old_pages()
-    normalize_existing_paths()
+    normalize_existing_artifact_paths()
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
@@ -1488,8 +1676,10 @@ async def main():
     print("\n===== CREANDO ÍNDICE OFFLINE =====")
     create_offline_index()
 
-    audit_artifact_paths()
     save_maps()
+
+    print("\n===== AUDITANDO RUTAS DEL ARTEFACTO =====")
+    audit_artifact_paths()
 
     print("\n===== GENERANDO INFORME =====")
     create_report()
