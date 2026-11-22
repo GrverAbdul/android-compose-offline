@@ -100,6 +100,8 @@ file_to_url = {}
 page_urls = set()
 asset_urls = set()
 resource_locks = {}
+# Controla rutas locales para evitar colisiones (incluidas las diferencias de mayúsculas).
+local_path_owners = {}
 errors = []
 visited_by_site = {}
 site_storage = {}
@@ -208,38 +210,30 @@ def is_internal(url, site):
 
 
 def is_allowed_page(url, site):
-    """
-    Comprueba si una URL puede descargarse como página HTML.
-
-    Si el sitio tiene allowed_paths, solamente permite las rutas
-    que coincidan con esos prefijos.
-
-    Para eLearner se permite /es/, pero se excluyen las demás
-    versiones lingüísticas.
-    """
-
+    """Aplica host, rutas permitidas y exclusiones configuradas para cada sitio."""
     if not is_internal(url, site):
         return False
-
-    allowed_paths = site.get("allowed_paths")
-
-    if not allowed_paths:
-        return True
 
     try:
         path = urlsplit(url).path or "/"
 
+        # Las exclusiones se evalúan primero y funcionan incluso si no hay
+        # allowed_paths configurado. La coincidencia respeta límites de segmento.
+        for prefix in site.get("exclude_paths", []):
+            prefix = str(prefix).rstrip("/") or "/"
+            if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
+                return False
+
+        allowed_paths = site.get("allowed_paths")
+        if not allowed_paths:
+            return True
+
         for prefix in allowed_paths:
-            prefix = prefix.rstrip("/") or "/"
-
-            if prefix == "/":
-                return True
-
-            if path == prefix or path.startswith(prefix + "/"):
+            prefix = str(prefix).rstrip("/") or "/"
+            if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
                 return True
 
         return False
-
     except Exception:
         return False
 
@@ -341,15 +335,64 @@ def detect_extension(url, content_type, data):
     return ".bin"
 
 
+def sanitize_path_component(value, max_length=150):
+    """Convierte un componente URL en un nombre compatible con Windows y ZIP."""
+    value = str(value)
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
+    value = value.rstrip(" .")
+    if value in ("", ".", ".."):
+        value = "_"
+
+    # Windows reserva estos nombres incluso cuando llevan extensión.
+    stem = value.split(".", 1)[0].upper()
+    reserved = {"CON", "PRN", "AUX", "NUL"}
+    reserved.update(f"COM{i}" for i in range(1, 10))
+    reserved.update(f"LPT{i}" for i in range(1, 10))
+    if stem in reserved:
+        value = "_" + value
+
+    if len(value) > max_length:
+        suffix = Path(value).suffix
+        digest = hashlib.sha1(value.encode("utf-8", errors="replace")).hexdigest()[:10]
+        keep = max(1, max_length - len(suffix) - len(digest) - 2)
+        value = value[:keep] + "__" + digest + suffix
+
+    return value
+
+
+def reserve_local_path(url, path):
+    """Reserva una ruta; si otra URL reclama el mismo nombre, agrega hash estable."""
+    url = clean_url(url)
+    path = Path(path)
+    original = path
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
+    counter = 0
+
+    while True:
+        key = str(path).replace("\\", "/").casefold()
+        owner = local_path_owners.get(key)
+        occupied_by_other = owner is not None and owner != url
+        occupied_without_map = path.exists() and owner != url
+
+        if not occupied_by_other and not occupied_without_map:
+            local_path_owners[key] = url
+            return path
+
+        counter += 1
+        marker = "__" + digest + (f"_{counter}" if counter > 1 else "")
+        path = original.with_name(original.stem + marker + original.suffix)
+
+
 def safe_local_path(url, force_html=False, content_type=None):
     parts = urlsplit(url)
-    host = parts.hostname or "desconocido"
+    host = sanitize_path_component(parts.hostname or "desconocido", 150)
     web_path = unquote(parts.path or "/")
 
     if web_path.endswith("/"):
         web_path += "index"
 
-    relative = Path(host) / web_path.lstrip("/")
+    components = [sanitize_path_component(part) for part in web_path.lstrip("/").split("/") if part]
+    relative = Path(host).joinpath(*components) if components else Path(host) / "index"
     mime = (content_type or "").split(";")[0].strip().lower()
     suffix = relative.suffix.lower()
 
@@ -366,7 +409,7 @@ def safe_local_path(url, force_html=False, content_type=None):
             relative.stem + query_suffix(parts.query) + relative.suffix
         )
 
-    return ROOT / relative
+    return reserve_local_path(url, ROOT / relative)
 
 
 def register_url(url, path, is_page=False):
@@ -378,10 +421,100 @@ def register_url(url, path, is_page=False):
     path = Path(path)
     url_to_file[url] = path
     file_to_url[str(path)] = url
+    local_path_owners[str(path).replace("\\", "/").casefold()] = url
 
     if is_page:
         page_urls.add(url)
 
+
+
+def normalize_existing_paths():
+    """Renombra archivos/carpetas antiguos con nombres no portables y actualiza mapas."""
+    if not ROOT.exists():
+        return
+
+    # Primero archivos y luego directorios, desde las rutas más profundas.
+    entries = sorted(
+        [item for item in ROOT.rglob("*") if item != ROOT],
+        key=lambda item: len(item.parts),
+        reverse=True
+    )
+    moved = {}
+
+    for old in entries:
+        if not old.exists():
+            continue
+        safe_name = sanitize_path_component(old.name)
+        if safe_name == old.name:
+            continue
+        new = old.with_name(safe_name)
+        if new.exists():
+            digest = hashlib.sha1(str(old).encode("utf-8")).hexdigest()[:10]
+            new = old.with_name(old.stem + "__" + digest + old.suffix)
+        try:
+            old.rename(new)
+            moved[str(old)] = new
+            print("Ruta anterior normalizada:", old, "->", new)
+        except Exception as exc:
+            errors.append(f"NORMALIZAR RUTA | {old} | {exc}")
+
+    if moved:
+        for url, path in list(url_to_file.items()):
+            old_text = str(path)
+            replacement = moved.get(old_text)
+            if replacement is None:
+                # Si se movió un directorio padre, reconstruye la ruta relativa.
+                for old_text_key, new_path in moved.items():
+                    try:
+                        relative = Path(old_text).relative_to(Path(old_text_key))
+                        replacement = new_path / relative
+                        break
+                    except ValueError:
+                        continue
+            if replacement is not None:
+                url_to_file[url] = replacement
+
+        file_to_url.clear()
+        local_path_owners.clear()
+        for url, path in url_to_file.items():
+            if path.exists():
+                file_to_url[str(path)] = url
+                local_path_owners[str(path).replace("\\", "/").casefold()] = url
+
+
+def audit_artifact_paths():
+    """Comprueba nombres inválidos y colisiones case-insensitive antes del artefacto."""
+    invalid = []
+    collisions = {}
+    seen = {}
+    forbidden = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+    reserved = {"CON", "PRN", "AUX", "NUL"}
+    reserved.update(f"COM{i}" for i in range(1, 10))
+    reserved.update(f"LPT{i}" for i in range(1, 10))
+
+    for item in ROOT.rglob("*"):
+        relative = item.relative_to(ROOT)
+        for component in relative.parts:
+            component_stem = component.split(".", 1)[0].upper()
+            if (forbidden.search(component) or component.endswith((" ", "."))
+                    or component in ("", ".", "..") or component_stem in reserved):
+                invalid.append(str(relative))
+                break
+        key = str(relative).replace("\\", "/").casefold()
+        if key in seen and seen[key] != str(relative):
+            collisions.setdefault(key, [seen[key]]).append(str(relative))
+        else:
+            seen[key] = str(relative)
+
+    print("Auditoría de rutas: archivos/carpetas inválidos =", len(invalid),
+          "| colisiones =", len(collisions))
+    if invalid:
+        for item in invalid[:30]:
+            errors.append(f"RUTA NO PORTABLE | {item}")
+    if collisions:
+        for key, paths in collisions.items():
+            errors.append(f"COLISIÓN DE RUTA | {key} | {paths}")
+    return not invalid and not collisions
 
 def save_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -573,7 +706,7 @@ async def save_response_resource(response, site, tracker):
             extension = detect_extension(url, content_type, data)
             path = safe_local_path(url, content_type=content_type)
             if path.suffix.lower() != extension:
-                path = path.with_suffix(extension)
+                path = reserve_local_path(url, path.with_suffix(extension))
 
             if not save_limited_file(path, data, tracker, description=url):
                 return
@@ -1331,6 +1464,7 @@ async def main():
 
     load_previous_maps()
     infer_old_pages()
+    normalize_existing_paths()
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
@@ -1354,6 +1488,7 @@ async def main():
     print("\n===== CREANDO ÍNDICE OFFLINE =====")
     create_offline_index()
 
+    audit_artifact_paths()
     save_maps()
 
     print("\n===== GENERANDO INFORME =====")
