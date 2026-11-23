@@ -47,7 +47,7 @@ SITES = [
         "max_total_mb": 10000
     },
 
-    {
+    #{
         "name": "Storyteller - Ingles y Espanol",
         "start": "https://storytellerenglish.com/es/stories/",
         "starts": [
