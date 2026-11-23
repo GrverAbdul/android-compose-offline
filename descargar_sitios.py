@@ -44,10 +44,28 @@ SITES = [
             "https://polyglotreader.com/es/faq"
         ],
         "hosts": {"polyglotreader.com", "www.polyglotreader.com"},
+        # Inglés predeterminado sin prefijo; español bajo /es/.
+        # Los libros indican idioma en el sufijo del slug (-en-med, -es-easy).
+        "allowed_languages": {"en", "es"},
+        "language_filter": "polyglotreader",
         "max_total_mb": 10000
     },
 
-    #{"name": "Storyteller - Ingles y Espanol","start": "https://storytellerenglish.com/es/stories/","starts": ["https://storytellerenglish.com/es/stories/","https://storytellerenglish.com/en/stories/","https://storytellerenglish.com/es/","https://storytellerenglish.com/en/"],"hosts": {"storytellerenglish.com", "www.storytellerenglish.com"},"max_total_mb": 10000},
+    {
+        "name": "Storyteller - Ingles y Espanol",
+        "start": "https://storytellerenglish.com/es/stories/",
+        "starts": [
+            "https://storytellerenglish.com/es/stories/",
+            "https://storytellerenglish.com/en/stories/",
+            "https://storytellerenglish.com/es/",
+            "https://storytellerenglish.com/en/"
+        ],
+        "hosts": {"storytellerenglish.com", "www.storytellerenglish.com"},
+        # Solo se recorren las versiones /en/ y /es/.
+        "allowed_languages": {"en", "es"},
+        "language_filter": "language_prefix",
+        "max_total_mb": 10000
+    },
     
 ]
 
@@ -232,47 +250,98 @@ def is_internal(url, site):
         return False
 
 
+# Códigos habituales de idioma que pueden aparecer como primer segmento URL.
+# Se usan para distinguir /es/... o /fr/... de rutas normales como /stories/.
+KNOWN_LANGUAGE_CODES = {
+    "af", "ar", "az", "be", "bg", "bn", "bs", "ca", "cs", "cy",
+    "da", "de", "el", "en", "eo", "es", "et", "eu", "fa", "fi",
+    "fil", "fr", "ga", "gl", "gu", "he", "hi", "hr", "hu", "hy",
+    "id", "is", "it", "ja", "jv", "ka", "kk", "km", "kn", "ko",
+    "lo", "lt", "lv", "mk", "ml", "mn", "mr", "ms", "my", "ne",
+    "nl", "no", "pa", "pl", "pt", "ro", "ru", "si", "sk", "sl",
+    "sq", "sr", "sv", "sw", "ta", "te", "th", "tr", "uk", "ur",
+    "uz", "vi", "zh"
+}
+
+
 def is_allowed_page(url, site):
-    """
-    Comprueba si una URL puede descargarse como página HTML.
-
-    Si el sitio tiene allowed_paths, solamente permite las rutas
-    que coincidan con esos prefijos.
-
-    Para eLearner se permite /es/, pero se excluyen las demás
-    versiones lingüísticas.
-    """
-
+    """Filtra páginas por sitio sin bloquear rutas de contenido válidas."""
     if not is_internal(url, site):
         return False
 
     try:
-        path = urlsplit(url).path or "/"
+        parts = urlsplit(url)
+        path = parts.path or "/"
+        path_lower = path.lower()
+        query_lower = parts.query.lower()
+
+        # Exclusiones explícitas comunes a cualquier sitio configurado.
         for excluded in site.get("exclude_paths", []):
             excluded = excluded.rstrip("/") or "/"
             if path == excluded or path.startswith(excluded + "/"):
                 return False
-    except Exception:
-        return False
 
-    allowed_paths = site.get("allowed_paths")
+        language_filter = site.get("language_filter")
+        allowed_languages = {str(x).lower() for x in site.get("allowed_languages", set())}
 
-    if not allowed_paths:
+        if language_filter == "polyglotreader":
+            # 1) Las páginas tipo /read-french-books identifican el idioma
+            #    mediante su nombre, no mediante un prefijo /fr/.
+            read_books = re.search(r"(?:^|/)read-([a-z-]+)-books/?$", path_lower)
+            if read_books:
+                language_name = read_books.group(1).strip("-")
+                if language_name not in {"english", "spanish"}:
+                    return False
+
+            # 2) Si la ruta empieza con un código de idioma (/es/faq, /fr/faq),
+            #    solo se permiten inglés y español. El inglés predeterminado
+            #    sin prefijo sigue permitido.
+            first_segment = path.strip("/").split("/", 1)[0].lower()
+            language_code = first_segment.split("-", 1)[0]
+            if language_code in KNOWN_LANGUAGE_CODES and language_code not in allowed_languages:
+                return False
+
+            # 3) El catálogo utiliza query strings como ?lang=es.
+            #    Si el parámetro lang existe, solo se admiten en/es.
+            lang_values = re.findall(r"(?:^|&)lang=([^&]+)", query_lower)
+            if any(value not in allowed_languages for value in lang_values):
+                return False
+
+            # 4) Los libros aparecen como /catalog/<slug>-en-med,
+            #    /catalog/<slug>-es-easy, etc. Filtramos el código de idioma
+            #    del sufijo, sin bloquear /catalog ni rutas genéricas /book/.
+            last_segment = path_lower.rstrip("/").rsplit("/", 1)[-1]
+            book_language = re.search(r"-([a-z]{2})-[a-z0-9]+$", last_segment)
+            if book_language:
+                code = book_language.group(1)
+                if code in KNOWN_LANGUAGE_CODES and code not in allowed_languages:
+                    return False
+
+        elif language_filter == "language_prefix":
+            # Storyteller publica sus contenidos bajo /en/ y /es/.
+            # Se exige uno de esos prefijos para no incorporar otras versiones.
+            first_segment = path.strip("/").split("/", 1)[0].lower()
+            language_code = first_segment.split("-", 1)[0]
+            if language_code not in allowed_languages:
+                return False
+
+        else:
+            # Comportamiento genérico opcional para otros sitios.
+            if allowed_languages:
+                first_segment = path.strip("/").split("/", 1)[0].lower()
+                language_code = first_segment.split("-", 1)[0]
+                if language_code in KNOWN_LANGUAGE_CODES and language_code not in allowed_languages:
+                    return False
+
+        allowed_paths = site.get("allowed_paths")
+        if allowed_paths:
+            for prefix in allowed_paths:
+                prefix = prefix.rstrip("/") or "/"
+                if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
+                    return True
+            return False
+
         return True
-
-    try:
-        path = urlsplit(url).path or "/"
-
-        for prefix in allowed_paths:
-            prefix = prefix.rstrip("/") or "/"
-
-            if prefix == "/":
-                return True
-
-            if path == prefix or path.startswith(prefix + "/"):
-                return True
-
-        return False
 
     except Exception:
         return False
