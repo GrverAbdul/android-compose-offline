@@ -44,7 +44,7 @@ SITES = [
             "https://polyglotreader.com/es/faq"
         ],
         "hosts": {"polyglotreader.com", "www.polyglotreader.com"},
-        "max_total_mb": 1024
+        "max_total_mb": 10000
     },
 
     {
@@ -57,7 +57,7 @@ SITES = [
             "https://storytellerenglish.com/en/"
         ],
         "hosts": {"storytellerenglish.com", "www.storytellerenglish.com"},
-        "max_total_mb": 1024
+        "max_total_mb": 10000
     },
     
 ]
@@ -67,7 +67,7 @@ METADATA = ROOT / "_metadata"
 URL_MAP_FILE = METADATA / "url-map.json"
 PAGE_MAP_FILE = METADATA / "page-map.json"
 
-MAX_PAGES_PER_SITE = 50000
+MAX_PAGES_PER_SITE = 500000
 MAX_DEPTH = 35
 NAVIGATION_TIMEOUT = 45000
 NETWORK_IDLE_TIMEOUT = 2500
@@ -124,6 +124,8 @@ file_to_url = {}
 page_urls = set()
 asset_urls = set()
 resource_locks = {}
+api_responses = []
+api_response_locks = {}
 errors = []
 visited_by_site = {}
 site_storage = {}
@@ -143,6 +145,9 @@ def create_site_tracker(site):
         "limite_bytes": int(limit_mb * 1024 * 1024),
         "bytes_guardados": 0,
         "archivos": {},
+        "api_firmas": set(),
+        "api_guardadas": 0,
+        "api_omitidas": 0,
         "limite_alcanzado": False
     }
 
@@ -761,6 +766,113 @@ def normalize_existing_artifact_paths():
         print(f"Rutas heredadas normalizadas: {renamed}")
 
 
+def api_request_identity(request):
+    """Identidad estable: URL + método + hash del cuerpo enviado."""
+    method = (request.method or "GET").upper()
+    post_data = request.post_data or ""
+    body_hash = hashlib.sha256(post_data.encode("utf-8", errors="replace")).hexdigest()[:16] if post_data else "no-body"
+    identity = f"{method}\n{clean_url(request.url)}\n{body_hash}"
+    digest = hashlib.sha256(identity.encode("utf-8", errors="replace")).hexdigest()
+    return method, body_hash, digest
+
+
+async def save_api_response(response, site, tracker):
+    """Registra y guarda respuestas de fetch/XHR de tipo textual."""
+    request = response.request
+    url = clean_url(response.url)
+    method, body_hash, digest = api_request_identity(request)
+    headers = response.headers
+    content_type = headers.get("content-type", "")
+    mime = content_type.split(";")[0].strip().lower()
+    status = response.status
+    entry = {
+        "sitio": site["name"],
+        "url": url,
+        "metodo": method,
+        "tipo_recurso": request.resource_type,
+        "estado_http": status,
+        "content_type": content_type,
+        "tamano_bytes": None,
+        "hash_cuerpo_solicitud": body_hash,
+        "archivo": None,
+        "guardado": False,
+        "motivo_omision": None,
+    }
+
+    # Se registra incluso cuando el host/MIME/estado no permite guardar el cuerpo.
+    api_responses.append(entry)
+
+    if status not in (200, 206):
+        entry["motivo_omision"] = "estado_http_no_descargable"
+        tracker["api_omitidas"] += 1
+        return
+    if not url or not is_allowed_resource(url, site):
+        entry["motivo_omision"] = "host_fuera_de_hosts_permitidos"
+        tracker["api_omitidas"] += 1
+        return
+
+    is_json = mime == "application/json" or mime.endswith("+json")
+    is_xml = mime in ("application/xml", "text/xml") or mime.endswith("+xml")
+    is_text = mime.startswith("text/")
+    if not (is_json or is_xml or is_text):
+        entry["motivo_omision"] = "mime_no_textual"
+        tracker["api_omitidas"] += 1
+        return
+
+    lock = api_response_locks.setdefault(digest, asyncio.Lock())
+    async with lock:
+        if digest in tracker["api_firmas"]:
+            entry["motivo_omision"] = "respuesta_duplicada"
+            tracker["api_omitidas"] += 1
+            return
+
+        length = headers.get("content-length")
+        if length:
+            try:
+                if int(length) > MAX_RESOURCE_SIZE:
+                    entry["motivo_omision"] = "supera_limite_por_archivo"
+                    tracker["api_omitidas"] += 1
+                    return
+            except ValueError:
+                pass
+
+        try:
+            data = await response.body()
+        except Exception as exc:
+            entry["motivo_omision"] = "error_leyendo_respuesta"
+            tracker["api_omitidas"] += 1
+            errors.append(f"API BODY | {url} | {exc}")
+            return
+
+        entry["tamano_bytes"] = len(data)
+        if not data:
+            entry["motivo_omision"] = "respuesta_vacia"
+            tracker["api_omitidas"] += 1
+            return
+        if len(data) > MAX_RESOURCE_SIZE:
+            entry["motivo_omision"] = "supera_limite_por_archivo"
+            tracker["api_omitidas"] += 1
+            return
+        if tracker["limite_alcanzado"]:
+            entry["motivo_omision"] = "limite_total_del_sitio_alcanzado"
+            tracker["api_omitidas"] += 1
+            return
+
+        extension = detect_extension(url, content_type, data)
+        api_dir = ROOT / (urlsplit(url).hostname or "host_desconocido") / "_api"
+        filename = f"{method.lower()}_{digest[:24]}{extension}"
+        path = api_dir / filename
+        if not save_limited_file(path, data, tracker, description=f"API {method} {url}"):
+            entry["motivo_omision"] = "limite_total_del_sitio_alcanzado"
+            tracker["api_omitidas"] += 1
+            return
+
+        tracker["api_firmas"].add(digest)
+        tracker["api_guardadas"] += 1
+        entry["archivo"] = str(path).replace("\\", "/")
+        entry["guardado"] = True
+
+
 async def save_response_resource(response, site, tracker):
     """Guarda recursos con bloqueo por URL: una descarga duplicada espera a la
     primera y, si esta falla, puede intentar guardar su propia respuesta.
@@ -774,10 +886,17 @@ async def save_response_resource(response, site, tracker):
         resource_type = response.request.resource_type
         if resource_type in ("document", "websocket"):
             return
-        if response.status not in (200, 206):
-            return
 
         url = clean_url(response.url)
+
+        # Registrar también errores HTTP y hosts externos para poder auditarlos.
+        # save_api_response decide si el cuerpo puede guardarse.
+        if resource_type in ("xhr", "fetch"):
+            await save_api_response(response, site, tracker)
+            return
+
+        if response.status not in (200, 206):
+            return
         if not url or not is_allowed_resource(url, site):
             return
 
@@ -1606,6 +1725,8 @@ def create_report():
             "disponible_MB": format_mb(max(0, limit - used)),
             "porcentaje_usado": round(used / limit * 100, 2) if limit else 0,
             "archivos_guardados": len(tracker["archivos"]),
+            "respuestas_api_guardadas": tracker.get("api_guardadas", 0),
+            "respuestas_api_omitidas": tracker.get("api_omitidas", 0),
             "limite_alcanzado": tracker["limite_alcanzado"],
         })
 
@@ -1624,6 +1745,8 @@ def create_report():
         "seleccion_bilingue_mdn": mdn_language_stats,
         "paginas_en_mapa": len(page_urls),
         "recursos_capturados": len(asset_urls),
+        "respuestas_fetch_xhr_detectadas": len(api_responses),
+        "respuestas_fetch_xhr": api_responses,
         "archivos_generados": len(files),
         "tamano_total_bytes": total_bytes,
         "tamano_total_MB": round(total_bytes / 1024 / 1024, 2),
@@ -1642,9 +1765,11 @@ def create_report():
             "MDN usa español como idioma prioritario y conserva en inglés "
             "las páginas /en-US/docs/ cuyo equivalente /es/docs/ no existe. "
             "Se excluye /en-US/play y se conserva /es/play. "
-            "Los contenidos dependientes de APIs, autenticación, streaming "
-            "o servidores externos pueden no funcionar completamente "
-            "sin conexión."
+            "Las respuestas fetch/XHR textuales se guardan en carpetas _api "
+            "con identidad por URL, método y hash del cuerpo POST. Esto no "
+            "reconecta automáticamente la aplicación con esos archivos: "
+            "las funciones que consultan APIs pueden seguir necesitando "
+            "internet, autenticación o lógica adicional para uso offline."
         )
     }
 
@@ -1655,6 +1780,11 @@ def create_report():
 
     Path("errores-descarga.txt").write_text(
         "\n".join(errors),
+        encoding="utf-8"
+    )
+
+    (METADATA / "api-responses.json").write_text(
+        json.dumps(api_responses, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
 
