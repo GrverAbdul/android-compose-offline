@@ -47,18 +47,7 @@ SITES = [
         "max_total_mb": 10000
     },
 
-    #{
-        "name": "Storyteller - Ingles y Espanol",
-        "start": "https://storytellerenglish.com/es/stories/",
-        "starts": [
-            "https://storytellerenglish.com/es/stories/",
-            "https://storytellerenglish.com/en/stories/",
-            "https://storytellerenglish.com/es/",
-            "https://storytellerenglish.com/en/"
-        ],
-        "hosts": {"storytellerenglish.com", "www.storytellerenglish.com"},
-        "max_total_mb": 10000
-    },
+    #{"name": "Storyteller - Ingles y Espanol","start": "https://storytellerenglish.com/es/stories/","starts": ["https://storytellerenglish.com/es/stories/","https://storytellerenglish.com/en/stories/","https://storytellerenglish.com/es/","https://storytellerenglish.com/en/"],"hosts": {"storytellerenglish.com", "www.storytellerenglish.com"},"max_total_mb": 10000},
     
 ]
 
