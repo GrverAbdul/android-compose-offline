@@ -32,7 +32,7 @@ SITES = [
     #{"name": "Duobi Cursos", "start": "https://www.duobi.tech/cursos", "hosts": {"www.duobi.tech"}, "max_total_mb": 4096},
     #{"name": "Pro Git Español", "start": "https://git-scm.com/book/es/v2", "hosts": {"git-scm.com"}, "max_total_mb": 4096},
     #{"name": "Full Stack Open Español", "start": "https://fullstackopen.com/es/", "hosts": {"fullstackopen.com"}, "max_total_mb": 4096},
-    {"name": "MDN Web Docs - Español prioritario + inglés complementario", "start": "https://developer.mozilla.org/es/", "starts": ["https://developer.mozilla.org/es/", "https://developer.mozilla.org/en-US/"], "hosts": {"developer.mozilla.org"}, "allowed_paths": ["/es/", "/en-US/"], "exclude_paths": ["/en-US/play"], "language_strategy": "mdn_es_then_en", "max_total_mb": 10000},
+    {"name": "MDN Web Docs - Español prioritario + inglés complementario", "start": "https://developer.mozilla.org/es/", "starts": ["https://developer.mozilla.org/es/", "https://developer.mozilla.org/en-US/"], "hosts": {"developer.mozilla.org"}, "allowed_paths": ["/es/", "/en-US/"], "language_strategy": "mdn_es_then_en", "max_total_mb": 10000},
     #{"name": "Curso Completo de Ciberseguridad - Antinori Ariel", "start": "https://github.com/antinoriariel/curso_ciberseguridad", "hosts": {"github.com"}, "allowed_paths": ["/antinoriariel/curso_ciberseguridad"], "resource_hosts": {"raw.githubusercontent.com"}, "max_total_mb": 5000},
     
 ]
