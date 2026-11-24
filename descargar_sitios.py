@@ -7,21 +7,16 @@ from pathlib import Path
 from functools import lru_cache
 from urllib.parse import urljoin, urlsplit, urlunsplit, unquote
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# --- IMPORTACIÓN OPCIONAL DE PLAYWRIGHT-STEALTH ---
-# Si no lo tienes instalado, puedes instalarlo con: pip install playwright-stealth
-try:
-    from playwright_stealth import stealth_async
-    STEALTH_AVAILABLE = True
-except ImportError:
-    STEALTH_AVAILABLE = False
+# --- PATCHRIGHT (reemplazo de Playwright con evasión anti-bot integrada) ---
+from patchright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
 
 # ============================================================
 # CONFIGURACIÓN DE SITIOS
 # ============================================================
 SITES = [
-
+    
     # --- NUEVOS SITIOS AÑADIDOS ---
     # 1. PONN.IO (Inglés y Español)
     #    Se usa 'expand_load_more' porque el catálogo de libros se carga dinámicamente.
@@ -34,15 +29,14 @@ SITES = [
             "https://ponn.io/en/english/books/"
         ],
         "hosts": {"ponn.io"},
-        "allowed_paths": ["/es/", "/en/"],  # Solo permite rutas que empiecen por /es/ o /en/
-        "exclude_paths": ["/de/", "/fr/", "/it/", "/pt/", "/ru/", "/ja/", "/ko/", "/zh/"],  # Bloquea otros idiomas
-        "expand_load_more": True,           # Activa la función de "Cargar más"
-        "max_load_more_clicks": 100,        # Límite de seguridad
+        "allowed_paths": ["/es/", "/en/"],
+        "exclude_paths": ["/de/", "/fr/", "/it/", "/pt/", "/ru/", "/ja/", "/ko/", "/zh/"],
+        "expand_load_more": True,
+        "max_load_more_clicks": 100,
         "max_total_mb": 10000
     },
 
     # 2. MINIMAL BOOKS (Inglés y Español)
-    #    Se asume que las rutas de idioma son /en/ y /es/. Si solo existe /es/, el crawler simplemente no encontrará enlaces en /en/.
     {
         "name": "Minimal Books",
         "start": "https://minimalbooks.com/",
@@ -52,7 +46,7 @@ SITES = [
             "https://minimalbooks.com/en/"
         ],
         "hosts": {"minimalbooks.com"},
-        "allowed_paths": ["/", "/es/", "/en/"], # Permite la raíz y los dos idiomas
+        "allowed_paths": ["/", "/es/", "/en/"],
         "exclude_paths": [
             "/wp-admin/", "/wp-login.php", "/cart/", "/checkout/"
         ],
@@ -60,18 +54,16 @@ SITES = [
     },
 
     # 3. BABELOTHECA
-    #    No tiene una estructura de rutas por idioma clara. Se usa 'exclude_paths' para bloquear prefijos de otros idiomas conocidos.
     {
         "name": "Babelotheca",
         "start": "https://babelotheca.com/bilingual-books",
         "starts": ["https://babelotheca.com/bilingual-books"],
         "hosts": {"babelotheca.com"},
-        "allowed_paths": None, # Se deja abierto porque las rutas de los libros pueden no compartir prefijo
+        "allowed_paths": None,
         "exclude_paths": [
             "/login", "/sign-in", "/signup", "/register",
             "/pricing", "/checkout", "/translate",
             "/account", "/settings", "/api/",
-            # Bloqueo de otros idiomas (aproximado)
             "/de/", "/fr/", "/it/", "/pt/", "/ru/", "/ja/", "/ko/", "/zh/"
         ],
         "max_total_mb": 5000
@@ -91,7 +83,7 @@ MAX_DEPTH = 35
 NAVIGATION_TIMEOUT = 45000
 NETWORK_IDLE_TIMEOUT = 2500
 WAIT_AFTER_LOAD_MS = 300
-PAGE_WORKERS = 4 # Reducido ligeramente para ser más cuidadoso con los sitios nuevos
+PAGE_WORKERS = 4
 NAVIGATION_RETRIES = 2
 MAX_PAGE_ATTEMPTS = 3
 RESOURCE_BODY_RETRIES = 2
@@ -150,7 +142,7 @@ site_storage = {}
 
 
 # ============================================================
-# FUNCIONES AUXILIARES (Se mantienen casi todas las tuyas)
+# FUNCIONES AUXILIARES
 # ============================================================
 def create_site_tracker(site):
     limit_mb = site.get("max_total_mb", 4096)
@@ -213,12 +205,14 @@ def clean_url(url):
             userinfo = parts.netloc.rsplit("@", 1)[0] + "@"
         netloc = userinfo + hostname
         path = parts.path or "/"
+
         def normalize_escape(match):
             value = int(match.group(1), 16)
             char = chr(value)
             if ("A" <= char <= "Z" or "a" <= char <= "z" or "0" <= char <= "9" or char in "-._~"):
                 return char
             return "%" + match.group(1).upper()
+
         path = re.sub(r"%([0-9a-fA-F]{2})", normalize_escape, path)
         query = re.sub(r"%([0-9a-fA-F]{2})", lambda m: "%" + m.group(1).upper(), parts.query)
         return urlunsplit((scheme, netloc, path, query, ""))
@@ -590,28 +584,23 @@ def is_probable_page(url):
 
 
 # ============================================================
-# NUEVA FUNCIÓN: EXPANDIR "CARGAR MÁS"
+# FUNCIÓN "CARGAR MÁS" GENÉRICA
 # ============================================================
 async def expand_load_more(page, site):
     """
-    Pulsa repetidamente un botón de "Cargar más" / "Load more" hasta que no aparezcan enlaces nuevos.
-    La búsqueda del botón es genérica y busca por texto visible.
-    Si el sitio usa un selector CSS específico, puedes cambiarlo en la variable 'selector_boton'.
+    Pulsa repetidamente un botón de "Cargar más" / "Load more" hasta que no aparezcan
+    enlaces nuevos. La búsqueda es genérica por texto visible. Si el sitio usa un
+    selector CSS específico, ajusta 'selector_boton'.
     """
     print(f"   [Expand] Iniciando expansión de 'Cargar más' para: {site['name']}")
     clicks = 0
     without_changes = 0
     max_clicks = site.get("max_load_more_clicks", 100)
 
-    # --- SELECTOR GENÉRICO ---
-    # Busca botones o enlaces cuyo texto contenga "load more", "cargar más", etc.
-    # Puedes reemplazar esto por un selector CSS específico si lo conoces.
     selector_boton = "button, a, [role='button']"
 
     while clicks < max_clicks:
         try:
-            # 1. Intentar encontrar y pulsar el botón
-            #    Se usa page.locator con un filtro de texto para ser más preciso.
             boton = page.locator(selector_boton).filter(
                 has_text=re.compile(r"(load\s*more|cargar\s*más|ver\s*más|show\s*more)", re.IGNORECASE)
             ).first
@@ -620,25 +609,21 @@ async def expand_load_more(page, site):
                 print("   [Expand] No se encontró botón de 'Cargar más'.")
                 break
 
-            # Comprobar si el botón es visible y está habilitado
             if not await boton.is_visible() or not await boton.is_enabled():
                 print("   [Expand] Botón no visible o deshabilitado.")
                 break
 
-            # 2. Guardar enlaces actuales antes de pulsar
             previous_links = set(
                 await page.locator("a[href]").evaluate_all(
                     "elements => elements.map(el => el.href).filter(Boolean)"
                 )
             )
 
-            # 3. Pulsar el botón
             await boton.click()
             clicks += 1
             print(f"   [Expand] Clic {clicks} realizado.")
 
-            # 4. Esperar a que aparezcan nuevos enlaces
-            await page.wait_for_timeout(1500)  # Espera inicial
+            await page.wait_for_timeout(1500)
             current_links = set(
                 await page.locator("a[href]").evaluate_all(
                     "elements => elements.map(el => el.href).filter(Boolean)"
@@ -650,7 +635,6 @@ async def expand_load_more(page, site):
                 without_changes = 0
                 print(f"   [Expand]   -> {len(new_links)} enlaces nuevos detectados.")
             else:
-                # A veces el contenido tarda un poco más en cargar. Se da una segunda oportunidad.
                 await page.wait_for_timeout(2000)
                 current_links = set(
                     await page.locator("a[href]").evaluate_all(
@@ -665,7 +649,6 @@ async def expand_load_more(page, site):
                     without_changes += 1
                     print(f"   [Expand]   -> Sin cambios ({without_changes}/2).")
 
-            # 5. Si no hay cambios en dos clics consecutivos, se considera terminado.
             if without_changes >= 2:
                 print("   [Expand] Detenido: no aparecen más enlaces nuevos.")
                 break
@@ -683,7 +666,7 @@ async def expand_load_more(page, site):
 
 
 # ============================================================
-# FUNCIÓN PRINCIPAL DE CRAWLING (MODIFICADA)
+# CRAWLING
 # ============================================================
 async def crawl_site(browser, site):
     print("\n" + "=" * 65)
@@ -698,9 +681,7 @@ async def crawl_site(browser, site):
     tracker = create_site_tracker(site)
     site_storage[site["name"]] = tracker
 
-    # --- CONTEXTO ANTI-403 ---
-    # Se añaden cabeceras realistas y un User-Agent de un navegador de escritorio.
-    # Esto es crucial para sitios como ponn.io que pueden bloquear peticiones de bots.
+    # Contexto con cabeceras realistas (complementa a Patchright)
     context = await browser.new_context(
         ignore_https_errors=True,
         viewport={"width": 1920, "height": 1080},
@@ -738,14 +719,6 @@ async def crawl_site(browser, site):
 
     worker_count = PAGE_WORKERS
     pages = [await context.new_page() for _ in range(worker_count)]
-
-    # --- APLICAR STEALTH (SI ESTÁ DISPONIBLE) ---
-    if STEALTH_AVAILABLE:
-        for page in pages:
-            await stealth_async(page)
-        print("   [Anti-403] playwright-stealth aplicado a las páginas.")
-    else:
-        print("   [Anti-403] playwright-stealth no está instalado. Se usarán solo cabeceras personalizadas.")
 
     def attach_resource_listener(page):
         def on_response(response):
@@ -821,7 +794,7 @@ async def crawl_site(browser, site):
                 except PlaywrightTimeoutError:
                     pass
 
-                # --- LAZY LOADING DE IMÁGENES ---
+                # Lazy loading de imágenes
                 try:
                     lazy_count = await page.locator('img[loading="lazy"], img[data-src], img[data-lazy-src]').count()
                     if lazy_count:
@@ -855,7 +828,7 @@ async def crawl_site(browser, site):
                 except Exception:
                     pass
 
-                # --- LLAMADA A LA NUEVA FUNCIÓN DE "CARGAR MÁS" ---
+                # "Cargar más" si el sitio lo requiere
                 if site.get("expand_load_more", False):
                     await expand_load_more(page, site)
 
@@ -963,7 +936,7 @@ async def crawl_site(browser, site):
 
 
 # ============================================================
-# RESTO DE FUNCIONES (find_local_target, rewrite_html, etc.)
+# REESCRITURA Y OFFLINE
 # ============================================================
 @lru_cache(maxsize=500000)
 def find_local_target(url):
@@ -1046,6 +1019,7 @@ def rewrite_css():
         if not source_url: continue
         try:
             content = css_file.read_text(encoding="utf-8", errors="replace")
+
             def replace_url(match):
                 raw = match.group(2).strip()
                 if not raw or raw.startswith(("data:", "blob:", "#")): return match.group(0)
@@ -1054,7 +1028,9 @@ def rewrite_css():
                 if not target: return match.group(0)
                 quote_char = match.group(1)
                 return "url(" + quote_char + relative_target(css_file, target) + quote_char + ")"
+
             content = url_pattern.sub(replace_url, content)
+
             def replace_import(match):
                 raw = match.group(2).strip()
                 absolute = clean_url(urljoin(source_url, raw))
@@ -1062,6 +1038,7 @@ def rewrite_css():
                 if not target: return match.group(0)
                 quote_char = match.group(1)
                 return "@import " + quote_char + relative_target(css_file, target) + quote_char
+
             content = import_pattern.sub(replace_import, content)
             css_file.write_text(content, encoding="utf-8")
         except Exception as exc:
@@ -1088,6 +1065,7 @@ def create_offline_index():
             links.append(f'<li><a href="{href}">{site["name"]}</a></li>')
         else:
             links.append(f'<li>{site["name"]} — página inicial no encontrada</li>')
+
     html = '''<!doctype html>
 <html lang="es">
 <head>
@@ -1155,31 +1133,56 @@ def create_report():
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+# ============================================================
+# MAIN
+# ============================================================
 async def main():
     ROOT.mkdir(parents=True, exist_ok=True)
     METADATA.mkdir(parents=True, exist_ok=True)
     print("=" * 65)
-    print("DESCARGADOR DE DOCUMENTACIÓN OFFLINE")
+    print("DESCARGADOR DE DOCUMENTACIÓN OFFLINE (Patchright)")
     print("SITIOS CONFIGURADOS:", len(SITES))
     print("MÁXIMO DE PÁGINAS POR SITIO:", MAX_PAGES_PER_SITE)
     print("PROFUNDIDAD MÁXIMA:", MAX_DEPTH)
     print("MÁXIMO POR ARCHIVO:", format_mb(MAX_RESOURCE_SIZE), "MB")
     print("TRABAJADORES SIMULTÁNEOS:", PAGE_WORKERS)
     print("=" * 65)
+
     load_previous_maps()
     infer_old_pages()
     normalize_existing_paths()
+
     async with async_playwright() as playwright:
-        # Se añade --disable-blink-features=AutomationControlled para intentar ocultar la automatización.
-        browser = await playwright.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
-        )
+        # Intentar usar Google Chrome real (canal "chrome") si está instalado.
+        # Si falla, Patchright usa su propio Chromium parcheado.
+        try:
+            browser = await playwright.chromium.launch(
+                headless=True,
+                channel="chrome",
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                ]
+            )
+            print("[Patchright] Navegador lanzado con canal 'chrome'.")
+        except Exception as exc:
+            print(f"[Patchright] 'chrome' no disponible ({exc}). Usando Chromium parcheado de Patchright.")
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                ]
+            )
+
         try:
             for site in SITES:
                 await crawl_site(browser, site)
         finally:
             await browser.close()
+
     print("\n===== GUARDANDO MAPAS =====")
     save_maps()
     print("\n===== REESCRIBIENDO HTML =====")
