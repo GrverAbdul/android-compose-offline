@@ -13,13 +13,13 @@ from patchright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 
 # ============================================================
-# CONFIGURACIÓN DEL PROXY (WEBSHARE)
+# CONFIGURACIÓN DEL PROXY (SCRAPEOPS - RESIDENCIAL)
 # Se aplica solo a los sitios que tengan "use_proxy": True
 # ============================================================
 PROXY_CONFIG = {
-    "server": "http://p.webshare.io:80",
-    "username": "jtcjdehx-rotate",
-    "password": "yu84na1lkxxh",
+    "server": "http://residential-proxy.scrapeops.io:8181",
+    "username": "scrapeops",
+    "password": "fe707f64-d71e-4ece-a817-97138a766851",
 }
 
 
@@ -28,7 +28,7 @@ PROXY_CONFIG = {
 # Cada sitio en una sola línea. Descomenta el que quieras activar.
 # ============================================================
 SITES = [
-    # --- ACTIVO: PONN.IO (con proxy y expansión "Cargar más") ---
+    # --- ACTIVO: PONN.IO (con proxy residencial y expansión "Cargar más") ---
     {"name": "Ponn.io - Inglés y Español", "start": "https://ponn.io/es/ingles/libros/", "starts": ["https://ponn.io/es/ingles/libros/", "https://ponn.io/en/english/books/"], "hosts": {"ponn.io"}, "allowed_paths": ["/es/", "/en/"], "exclude_paths": ["/de/", "/fr/", "/it/", "/pt/", "/ru/", "/ja/", "/ko/", "/zh/"], "expand_load_more": True, "max_load_more_clicks": 100, "use_proxy": True, "max_total_mb": 10000},
 
     # --- COMENTADOS: descomenta la línea entera para activarlos ---
