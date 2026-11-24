@@ -1,28 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-DESCARGADOR OFFLINE — BIBLIOTECA BILINGÜE (INGLÉS + ESPAÑOL)
-
-Sitios:
-  1. Minimal Books
-  2. PONN.IO (catálogo de libros en inglés)
-  3. Babelotheca (libros bilingües)
-
-Basado en el enfoque del descargador especializado de Storyteller:
-- Playwright/Chromium para capturar páginas ya renderizadas.
-- Expansión de botones "Load more / Cargar más".
-- Scroll progresivo para activar lazy loading.
-- Descubrimiento recursivo de páginas internas.
-- Captura de CSS, JavaScript, imágenes, fuentes, audio y vídeo solicitados.
-- Reescritura de enlaces HTML/CSS para abrir la copia local.
-- Una carpeta y mapas independientes por sitio.
-- Sin inicio de sesión ni automatización de cuentas.
-
-IMPORTANTE:
-Una copia estática no puede reproducir servicios que dependan de servidores,
-API privadas, autenticación, streaming externo o funciones que necesiten conexión.
-El script no intenta eludir restricciones ni descargar contenido protegido.
-"""
-
 import asyncio
 import hashlib
 import json
@@ -34,11 +9,6 @@ from urllib.parse import urljoin, urlsplit, urlunsplit, unquote
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
-
-
-# ============================================================
-# CONFIGURACIÓN GENERAL
-# ============================================================
 
 OUTPUT_ROOT = Path("bibliotecas_offline")
 
