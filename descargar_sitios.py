@@ -5,16 +5,13 @@ import json
 import hashlib
 from pathlib import Path
 from functools import lru_cache
-from urllib.parse import urljoin, urlsplit, urlunsplit, unquote
+from urllib.parse import urljoin, urlsplit, urlunsplit, unquote, parse_qs
 from bs4 import BeautifulSoup
 
-# --- PATCHRIGHT (reemplazo de Playwright con evasión anti-bot integrada) ---
 from patchright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-
 # ============================================================
-# CONFIGURACIÓN DEL PROXY (SCRAPEOPS - RESIDENCIAL)
-# Se aplica solo a los sitios que tengan "use_proxy": True
+# PROXY (ScrapeOps - Residencial)
 # ============================================================
 PROXY_CONFIG = {
     "server": "http://residential-proxy.scrapeops.io:8181",
@@ -22,24 +19,47 @@ PROXY_CONFIG = {
     "password": "fe707f64-d71e-4ece-a817-97138a766851",
 }
 
-
 # ============================================================
 # CONFIGURACIÓN DE SITIOS
-# Cada sitio en una sola línea. Descomenta el que quieras activar.
 # ============================================================
 SITES = [
-    # --- ACTIVO: PONN.IO (con proxy residencial y expansión "Cargar más") ---
-    {"name": "Ponn.io - Inglés y Español", "start": "https://ponn.io/es/ingles/libros/", "starts": ["https://ponn.io/es/ingles/libros/", "https://ponn.io/en/english/books/"], "hosts": {"ponn.io"}, "allowed_paths": ["/es/", "/en/"], "exclude_paths": ["/de/", "/fr/", "/it/", "/pt/", "/ru/", "/ja/", "/ko/", "/zh/"], "expand_load_more": True, "max_load_more_clicks": 100, "use_proxy": True, "max_total_mb": 10000},
-
-    # --- COMENTADOS: descomenta la línea entera para activarlos ---
-    # {"name": "Tutoriales Programacion Ya", "start": "https://www.tutorialesprogramacionya.com/", "hosts": {"www.tutorialesprogramacionya.com", "tutorialesprogramacionya.com"}, "max_total_mb": 10000},
-    # {"name": "Curso Completo de Ciberseguridad - Antinori Ariel", "start": "https://github.com/antinoriariel/curso_ciberseguridad", "hosts": {"github.com"}, "allowed_paths": ["/antinoriariel/curso_ciberseguridad"], "exclude_paths": ["/antinoriariel/curso_ciberseguridad/compare/"], "resource_hosts": {"raw.githubusercontent.com"}, "max_total_mb": 5000},
-    # {"name": "Minimal Books", "start": "https://minimalbooks.com/", "starts": ["https://minimalbooks.com/", "https://minimalbooks.com/es/", "https://minimalbooks.com/en/"], "hosts": {"minimalbooks.com"}, "allowed_paths": ["/", "/es/", "/en/"], "exclude_paths": ["/wp-admin/", "/wp-login.php", "/cart/", "/checkout/"], "max_total_mb": 5000},
-    # {"name": "Babelotheca", "start": "https://babelotheca.com/bilingual-books", "starts": ["https://babelotheca.com/bilingual-books"], "hosts": {"babelotheca.com"}, "allowed_paths": None, "exclude_paths": ["/login", "/sign-in", "/signup", "/register", "/pricing", "/checkout", "/translate", "/account", "/settings", "/api/", "/de/", "/fr/", "/it/", "/pt/", "/ru/", "/ja/", "/ko/", "/zh/"], "max_total_mb": 5000},
+    {
+        "name": "Ponn.io - Inglés (UI español)",
+        "start": "https://ponn.io/es/",
+        "starts": ["https://ponn.io/es/"],
+        "hosts": {"ponn.io"},
+        "resource_hosts": {"archive.org", "www.archive.org"},
+        "allowed_paths": [
+            "/es/",
+            "/reader.html",
+            "/audiobooks/",
+            "/games/",
+            "/sandbox/",
+        ],
+        "exclude_paths": [
+            # Interfaz inglesa (no la queremos)
+            "/en/",
+            # Otros idiomas de libros (segundo segmento)
+            "/es/serbio/", "/es/aleman/", "/es/frances/", "/es/italiano/",
+            "/es/portugues/", "/es/ruso/", "/es/japones/", "/es/chino/",
+            "/es/coreano/", "/es/arabe/", "/es/turco/", "/es/polaco/",
+            "/es/holandes/", "/es/sueco/", "/es/noruego/", "/es/danes/",
+            "/es/finlandes/", "/es/griego/", "/es/hebreo/", "/es/hindi/",
+            # Secciones que quieres ignorar
+            "/es/ingles/video/", "/es/ingles/cursos/",
+        ],
+        "expand_load_more": True,
+        "max_load_more_clicks": 100,
+        "use_proxy": True,
+        "max_total_mb": 10000,
+    },
+    # --- COMENTADOS ---
+    # {"name": "Minimal Books", ...},
+    # {"name": "Babelotheca", ...},
 ]
 
 # ============================================================
-# CONSTANTES Y VARIABLES GLOBALES
+# CONSTANTES (sin cambios)
 # ============================================================
 ROOT = Path("salida")
 METADATA = ROOT / "_metadata"
@@ -110,7 +130,7 @@ site_storage = {}
 
 
 # ============================================================
-# FUNCIONES AUXILIARES
+# FUNCIONES AUXILIARES (sin cambios, salvo is_allowed_page)
 # ============================================================
 def create_site_tracker(site):
     limit_mb = site.get("max_total_mb", 4096)
@@ -196,21 +216,36 @@ def is_internal(url, site):
 
 
 def is_allowed_page(url, site):
+    """Filtra por host, rutas permitidas/excluidas y, para reader.html, por lang=es."""
     if not is_internal(url, site):
         return False
     try:
-        path = urlsplit(url).path or "/"
+        parts = urlsplit(url)
+        path = parts.path or "/"
+
+        # Exclusiones primero
         for prefix in site.get("exclude_paths", []):
             prefix = str(prefix).rstrip("/") or "/"
             if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
                 return False
+
+        # Regla especial para reader.html: solo lang=es
+        if path == "/reader.html":
+            qs = parse_qs(parts.query)
+            lang = qs.get("lang", [None])[0]
+            if lang != "es":
+                return False
+            # Si pasa el filtro de lang, lo permitimos (ya está en allowed_paths)
+
         allowed_paths = site.get("allowed_paths")
         if not allowed_paths:
             return True
+
         for prefix in allowed_paths:
             prefix = str(prefix).rstrip("/") or "/"
             if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
                 return True
+
         return False
     except Exception:
         return False
@@ -338,6 +373,7 @@ def register_url(url, path, is_page=False):
         page_urls.add(url)
 
 
+# (normalize_existing_paths, audit_artifact_paths, save_json, load_previous_maps, infer_old_pages se mantienen igual)
 def normalize_existing_paths():
     if not ROOT.exists():
         return
@@ -476,6 +512,7 @@ def infer_old_pages():
             register_url("https://" + host + inferred_path + ".html", html_file, is_page=True)
 
 
+# (save_response_resource, extract_page_links, is_probable_page, expand_load_more, crawl_site se mantienen igual)
 async def save_response_resource(response, site, tracker):
     url = ""
     try:
@@ -551,9 +588,6 @@ def is_probable_page(url):
     return extension not in NON_PAGE_EXTENSIONS
 
 
-# ============================================================
-# FUNCIÓN "CARGAR MÁS" GENÉRICA
-# ============================================================
 async def expand_load_more(page, site):
     print(f"   [Expand] Iniciando expansión de 'Cargar más' para: {site['name']}")
     clicks = 0
@@ -626,9 +660,6 @@ async def expand_load_more(page, site):
     return clicks
 
 
-# ============================================================
-# CRAWLING
-# ============================================================
 async def crawl_site(browser, site):
     print("\n" + "=" * 65)
     print("SITIO:", site["name"])
@@ -644,7 +675,6 @@ async def crawl_site(browser, site):
     tracker = create_site_tracker(site)
     site_storage[site["name"]] = tracker
 
-    # --- Construcción del contexto (con o sin proxy según el sitio) ---
     context_kwargs = dict(
         ignore_https_errors=True,
         viewport={"width": 1920, "height": 1080},
@@ -762,7 +792,6 @@ async def crawl_site(browser, site):
                 except PlaywrightTimeoutError:
                     pass
 
-                # Lazy loading de imágenes
                 try:
                     lazy_count = await page.locator('img[loading="lazy"], img[data-src], img[data-lazy-src]').count()
                     if lazy_count:
@@ -796,7 +825,6 @@ async def crawl_site(browser, site):
                 except Exception:
                     pass
 
-                # "Cargar más" si el sitio lo requiere
                 if site.get("expand_load_more", False):
                     await expand_load_more(page, site)
 
@@ -904,9 +932,7 @@ async def crawl_site(browser, site):
     print("-" * 55)
 
 
-# ============================================================
-# REESCRITURA Y OFFLINE
-# ============================================================
+# (find_local_target, relative_target, rewrite_html, rewrite_css, save_maps, create_offline_index, create_report se mantienen igual)
 @lru_cache(maxsize=500000)
 def find_local_target(url):
     url = clean_url(url)
@@ -1102,9 +1128,6 @@ def create_report():
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
-# ============================================================
-# MAIN
-# ============================================================
 async def main():
     ROOT.mkdir(parents=True, exist_ok=True)
     METADATA.mkdir(parents=True, exist_ok=True)
