@@ -51,7 +51,7 @@ SITES = [
         "expand_load_more": True,
         "max_load_more_clicks": 100,
         "use_proxy": True,
-        "max_total_mb": 10000,
+        "max_total_mb": 15000,
     },
     # --- COMENTADOS ---
     # {"name": "Minimal Books", ...},
@@ -66,7 +66,7 @@ METADATA = ROOT / "_metadata"
 URL_MAP_FILE = METADATA / "url-map.json"
 PAGE_MAP_FILE = METADATA / "page-map.json"
 
-MAX_PAGES_PER_SITE = 50000
+MAX_PAGES_PER_SITE = 55000
 MAX_DEPTH = 35
 NAVIGATION_TIMEOUT = 45000
 NETWORK_IDLE_TIMEOUT = 2500
