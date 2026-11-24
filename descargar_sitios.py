@@ -13,61 +13,30 @@ from patchright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 
 # ============================================================
+# CONFIGURACIÓN DEL PROXY RESIDENCIAL (BYTESFLOWS)
+# Se aplica solo a los sitios que tengan "use_proxy": True
+# ============================================================
+PROXY_CONFIG = {
+    "server": "http://p1.bytesflows.com:8001",
+    # Sesión fija (-s-) de 30 minutos (-t-). Cambia "ponnio01" si necesitas otra IP.
+    "username": "u-T1lLi2kJ-s-ponnio01-t-30",
+    "password": "wazL7dhB",
+}
+
+
+# ============================================================
 # CONFIGURACIÓN DE SITIOS
+# Cada sitio en una sola línea. Descomenta el que quieras activar.
 # ============================================================
 SITES = [
-    
-    # --- NUEVOS SITIOS AÑADIDOS ---
-    # 1. PONN.IO (Inglés y Español)
-    #    Se usa 'expand_load_more' porque el catálogo de libros se carga dinámicamente.
-    #    'allowed_paths' restringe la descarga a las rutas de inglés y español.
-    {
-        "name": "Ponn.io - Inglés y Español",
-        "start": "https://ponn.io/es/ingles/libros/",
-        "starts": [
-            "https://ponn.io/es/ingles/libros/",
-            "https://ponn.io/en/english/books/"
-        ],
-        "hosts": {"ponn.io"},
-        "allowed_paths": ["/es/", "/en/"],
-        "exclude_paths": ["/de/", "/fr/", "/it/", "/pt/", "/ru/", "/ja/", "/ko/", "/zh/"],
-        "expand_load_more": True,
-        "max_load_more_clicks": 100,
-        "max_total_mb": 10000
-    },
+    # --- ACTIVO: PONN.IO (con proxy residencial y expansión "Cargar más") ---
+    {"name": "Ponn.io - Inglés y Español", "start": "https://ponn.io/es/ingles/libros/", "starts": ["https://ponn.io/es/ingles/libros/", "https://ponn.io/en/english/books/"], "hosts": {"ponn.io"}, "allowed_paths": ["/es/", "/en/"], "exclude_paths": ["/de/", "/fr/", "/it/", "/pt/", "/ru/", "/ja/", "/ko/", "/zh/"], "expand_load_more": True, "max_load_more_clicks": 100, "use_proxy": True, "max_total_mb": 10000},
 
-    # 2. MINIMAL BOOKS (Inglés y Español)
-    {
-        "name": "Minimal Books",
-        "start": "https://minimalbooks.com/",
-        "starts": [
-            "https://minimalbooks.com/",
-            "https://minimalbooks.com/es/",
-            "https://minimalbooks.com/en/"
-        ],
-        "hosts": {"minimalbooks.com"},
-        "allowed_paths": ["/", "/es/", "/en/"],
-        "exclude_paths": [
-            "/wp-admin/", "/wp-login.php", "/cart/", "/checkout/"
-        ],
-        "max_total_mb": 5000
-    },
-
-    # 3. BABELOTHECA
-    {
-        "name": "Babelotheca",
-        "start": "https://babelotheca.com/bilingual-books",
-        "starts": ["https://babelotheca.com/bilingual-books"],
-        "hosts": {"babelotheca.com"},
-        "allowed_paths": None,
-        "exclude_paths": [
-            "/login", "/sign-in", "/signup", "/register",
-            "/pricing", "/checkout", "/translate",
-            "/account", "/settings", "/api/",
-            "/de/", "/fr/", "/it/", "/pt/", "/ru/", "/ja/", "/ko/", "/zh/"
-        ],
-        "max_total_mb": 5000
-    },
+    # --- COMENTADOS: descomenta la línea entera para activarlos ---
+    # {"name": "Tutoriales Programacion Ya", "start": "https://www.tutorialesprogramacionya.com/", "hosts": {"www.tutorialesprogramacionya.com", "tutorialesprogramacionya.com"}, "max_total_mb": 10000},
+    # {"name": "Curso Completo de Ciberseguridad - Antinori Ariel", "start": "https://github.com/antinoriariel/curso_ciberseguridad", "hosts": {"github.com"}, "allowed_paths": ["/antinoriariel/curso_ciberseguridad"], "exclude_paths": ["/antinoriariel/curso_ciberseguridad/compare/"], "resource_hosts": {"raw.githubusercontent.com"}, "max_total_mb": 5000},
+    # {"name": "Minimal Books", "start": "https://minimalbooks.com/", "starts": ["https://minimalbooks.com/", "https://minimalbooks.com/es/", "https://minimalbooks.com/en/"], "hosts": {"minimalbooks.com"}, "allowed_paths": ["/", "/es/", "/en/"], "exclude_paths": ["/wp-admin/", "/wp-login.php", "/cart/", "/checkout/"], "max_total_mb": 5000},
+    # {"name": "Babelotheca", "start": "https://babelotheca.com/bilingual-books", "starts": ["https://babelotheca.com/bilingual-books"], "hosts": {"babelotheca.com"}, "allowed_paths": None, "exclude_paths": ["/login", "/sign-in", "/signup", "/register", "/pricing", "/checkout", "/translate", "/account", "/settings", "/api/", "/de/", "/fr/", "/it/", "/pt/", "/ru/", "/ja/", "/ko/", "/zh/"], "max_total_mb": 5000},
 ]
 
 # ============================================================
@@ -587,16 +556,10 @@ def is_probable_page(url):
 # FUNCIÓN "CARGAR MÁS" GENÉRICA
 # ============================================================
 async def expand_load_more(page, site):
-    """
-    Pulsa repetidamente un botón de "Cargar más" / "Load more" hasta que no aparezcan
-    enlaces nuevos. La búsqueda es genérica por texto visible. Si el sitio usa un
-    selector CSS específico, ajusta 'selector_boton'.
-    """
     print(f"   [Expand] Iniciando expansión de 'Cargar más' para: {site['name']}")
     clicks = 0
     without_changes = 0
     max_clicks = site.get("max_load_more_clicks", 100)
-
     selector_boton = "button, a, [role='button']"
 
     while clicks < max_clicks:
@@ -608,7 +571,6 @@ async def expand_load_more(page, site):
             if await boton.count() == 0:
                 print("   [Expand] No se encontró botón de 'Cargar más'.")
                 break
-
             if not await boton.is_visible() or not await boton.is_enabled():
                 print("   [Expand] Botón no visible o deshabilitado.")
                 break
@@ -644,7 +606,7 @@ async def expand_load_more(page, site):
                 new_links = current_links - previous_links
                 if new_links:
                     without_changes = 0
-                    print(f"   [Expand]   -> {len(new_links)} enlaces nuevos detectados (tras espera extra).")
+                    print(f"   [Expand]   -> {len(new_links)} enlaces nuevos (tras espera extra).")
                 else:
                     without_changes += 1
                     print(f"   [Expand]   -> Sin cambios ({without_changes}/2).")
@@ -676,13 +638,15 @@ async def crawl_site(browser, site):
     print("LÍMITE POR ARCHIVO:", format_mb(MAX_RESOURCE_SIZE), "MB")
     print("PÁGINAS SIMULTÁNEAS:", PAGE_WORKERS)
     print("INTENTOS MÁXIMOS POR PÁGINA:", MAX_PAGE_ATTEMPTS)
+    use_proxy = site.get("use_proxy", False)
+    print("PROXY RESIDENCIAL:", "ACTIVADO" if use_proxy else "desactivado")
     print("=" * 65)
 
     tracker = create_site_tracker(site)
     site_storage[site["name"]] = tracker
 
-    # Contexto con cabeceras realistas (complementa a Patchright)
-    context = await browser.new_context(
+    # --- Construcción del contexto (con o sin proxy según el sitio) ---
+    context_kwargs = dict(
         ignore_https_errors=True,
         viewport={"width": 1920, "height": 1080},
         locale="es-ES",
@@ -699,6 +663,11 @@ async def crawl_site(browser, site):
             "Sec-Fetch-User": "?1",
         }
     )
+    if use_proxy:
+        context_kwargs["proxy"] = PROXY_CONFIG
+        print(f"   [Proxy] Usando: {PROXY_CONFIG['server']} (usuario: {PROXY_CONFIG['username']})")
+
+    context = await browser.new_context(**context_kwargs)
     context.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
     context.set_default_timeout(15000)
 
@@ -919,7 +888,8 @@ async def crawl_site(browser, site):
         "almacenamiento_MB": format_mb(tracker["bytes_guardados"]),
         "limite_MB": tracker["limite_mb"],
         "limite_alcanzado": tracker["limite_alcanzado"],
-        "trabajadores_simultaneos": worker_count
+        "trabajadores_simultaneos": worker_count,
+        "proxy_usado": use_proxy,
     }
 
     await context.close()
@@ -1111,7 +1081,7 @@ def create_report():
             "limite_alcanzado": tracker["limite_alcanzado"],
         })
     report = {
-        "sitios": [{"name": s["name"], "start": s["start"], "hosts": sorted(s["hosts"]), "max_total_mb": s.get("max_total_mb", 2048)} for s in SITES],
+        "sitios": [{"name": s["name"], "start": s["start"], "hosts": sorted(s["hosts"]), "max_total_mb": s.get("max_total_mb", 2048), "use_proxy": s.get("use_proxy", False)} for s in SITES],
         "almacenamiento_por_sitio": storage_report,
         "paginas_por_sitio": visited_by_site,
         "paginas_en_mapa": len(page_urls),
@@ -1153,8 +1123,6 @@ async def main():
     normalize_existing_paths()
 
     async with async_playwright() as playwright:
-        # Intentar usar Google Chrome real (canal "chrome") si está instalado.
-        # Si falla, Patchright usa su propio Chromium parcheado.
         try:
             browser = await playwright.chromium.launch(
                 headless=True,
