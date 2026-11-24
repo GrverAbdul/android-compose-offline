@@ -13,14 +13,13 @@ from patchright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 
 # ============================================================
-# CONFIGURACIÓN DEL PROXY RESIDENCIAL (BYTESFLOWS)
+# CONFIGURACIÓN DEL PROXY (WEBSHARE)
 # Se aplica solo a los sitios que tengan "use_proxy": True
 # ============================================================
 PROXY_CONFIG = {
-    "server": "http://p1.bytesflows.com:8001",
-    # Sesión fija (-s-) de 30 minutos (-t-). Cambia "ponnio01" si necesitas otra IP.
-    "username": "u-T1lLi2kJ-s-ponnio01-t-30",
-    "password": "wazL7dhB",
+    "server": "http://p.webshare.io:80",
+    "username": "jtcjdehx-rotate",
+    "password": "yu84na1lkxxh",
 }
 
 
@@ -29,7 +28,7 @@ PROXY_CONFIG = {
 # Cada sitio en una sola línea. Descomenta el que quieras activar.
 # ============================================================
 SITES = [
-    # --- ACTIVO: PONN.IO (con proxy residencial y expansión "Cargar más") ---
+    # --- ACTIVO: PONN.IO (con proxy y expansión "Cargar más") ---
     {"name": "Ponn.io - Inglés y Español", "start": "https://ponn.io/es/ingles/libros/", "starts": ["https://ponn.io/es/ingles/libros/", "https://ponn.io/en/english/books/"], "hosts": {"ponn.io"}, "allowed_paths": ["/es/", "/en/"], "exclude_paths": ["/de/", "/fr/", "/it/", "/pt/", "/ru/", "/ja/", "/ko/", "/zh/"], "expand_load_more": True, "max_load_more_clicks": 100, "use_proxy": True, "max_total_mb": 10000},
 
     # --- COMENTADOS: descomenta la línea entera para activarlos ---
@@ -639,7 +638,7 @@ async def crawl_site(browser, site):
     print("PÁGINAS SIMULTÁNEAS:", PAGE_WORKERS)
     print("INTENTOS MÁXIMOS POR PÁGINA:", MAX_PAGE_ATTEMPTS)
     use_proxy = site.get("use_proxy", False)
-    print("PROXY RESIDENCIAL:", "ACTIVADO" if use_proxy else "desactivado")
+    print("PROXY:", "ACTIVADO" if use_proxy else "desactivado")
     print("=" * 65)
 
     tracker = create_site_tracker(site)
