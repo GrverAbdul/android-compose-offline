@@ -51,7 +51,7 @@ SITES = [
         "expand_load_more": True,
         "max_load_more_clicks": 100,
         "use_proxy": True,
-        "max_total_mb": 15000,
+        "max_total_mb": 20000,
     },
     # --- COMENTADOS ---
     # {"name": "Minimal Books", ...},
