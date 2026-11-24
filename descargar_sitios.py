@@ -3,6 +3,7 @@ import asyncio
 import re
 import json
 import hashlib
+import time
 from pathlib import Path
 from functools import lru_cache
 from urllib.parse import urljoin, urlsplit, urlunsplit, unquote, parse_qs
@@ -16,62 +17,68 @@ from patchright.async_api import async_playwright, TimeoutError as PlaywrightTim
 PROXY_CONFIG = {
     "server": "http://residential-proxy.scrapeops.io:8181",
     "username": "scrapeops",
-    "password": "fe707f64-d71e-4ece-a817-97138a766851",
+    "password": "7d7df815-de06-4ba8-9693-ab8cacefe03a",
 }
 
-# ============================================================
-# CONFIGURACIÓN DE SITIOS
-# ============================================================
+CATALOG_SEEDS = [
+    "https://ponn.io/books/mapping.json",
+    "https://ponn.io/books/reader-index.json",
+    "https://ponn.io/books/levels.json",
+    "https://ponn.io/books/chapter-summary/index.json",
+    "https://ponn.io/books/covers-lang.json",
+    "https://ponn.io/audiobooks/data/index.json",
+    "https://ponn.io/audiobooks/data/intro.json",
+    "https://ponn.io/audiobooks/data/intro1.json",
+    "https://ponn.io/audiobooks/data/intro-parts.json",
+    "https://ponn.io/audiobooks/data/locales.json",
+    "https://ponn.io/audiobooks/data/titles-es.json",
+    "https://ponn.io/audiobooks/data/desc-ids/es.json",
+    "https://ponn.io/audiobooks/data/desc/es.json",
+    "https://ponn.io/sandbox/reader-audio/audio.json",
+    "https://ponn.io/mw/lesson-tasks.css?v=2",
+    "https://ponn.io/mw/lesson-games.css?v=1104p",
+    "https://ponn.io/mw/lesson-games-es-f6f9e708.js?v=1104p",
+    "https://ponn.io/mw/lg-manifest-1264ceac.json",
+]
+
 SITES = [
     {
         "name": "Ponn.io - Inglés (UI español)",
         "start": "https://ponn.io/es/",
         "starts": ["https://ponn.io/es/"],
         "hosts": {"ponn.io"},
-        "resource_hosts": {"archive.org", "www.archive.org"},
-        "allowed_paths": [
-            "/es/",
-            "/reader.html",
-            "/audiobooks/",
-            "/games/",
-            "/sandbox/",
-        ],
+        "resource_hosts": set(),
+        "allowed_paths": ["/es/", "/reader.html", "/audiobooks/", "/games/", "/sandbox/"],
         "exclude_paths": [
-            # Interfaz inglesa (no la queremos)
             "/en/",
-            # Otros idiomas de libros (segundo segmento)
             "/es/serbio/", "/es/aleman/", "/es/frances/", "/es/italiano/",
             "/es/portugues/", "/es/ruso/", "/es/japones/", "/es/chino/",
             "/es/coreano/", "/es/arabe/", "/es/turco/", "/es/polaco/",
             "/es/holandes/", "/es/sueco/", "/es/noruego/", "/es/danes/",
             "/es/finlandes/", "/es/griego/", "/es/hebreo/", "/es/hindi/",
-            # Secciones que quieres ignorar
             "/es/ingles/video/", "/es/ingles/cursos/",
         ],
         "expand_load_more": True,
         "max_load_more_clicks": 100,
         "use_proxy": True,
-        "max_total_mb": 20000,
+        "max_total_mb": 50000,
     },
-    # --- COMENTADOS ---
-    # {"name": "Minimal Books", ...},
-    # {"name": "Babelotheca", ...},
 ]
 
-# ============================================================
-# CONSTANTES (sin cambios)
-# ============================================================
+CONTEXTS = {"proxy": None, "direct": None}
+CURRENT_TRACKER = {"ref": None}
+
 ROOT = Path("salida")
 METADATA = ROOT / "_metadata"
 URL_MAP_FILE = METADATA / "url-map.json"
 PAGE_MAP_FILE = METADATA / "page-map.json"
 
-MAX_PAGES_PER_SITE = 55000
+MAX_PAGES_PER_SITE = 50000
 MAX_DEPTH = 35
 NAVIGATION_TIMEOUT = 45000
 NETWORK_IDLE_TIMEOUT = 2500
 WAIT_AFTER_LOAD_MS = 300
-PAGE_WORKERS = 4
+PAGE_WORKERS = 2
 NAVIGATION_RETRIES = 2
 MAX_PAGE_ATTEMPTS = 3
 RESOURCE_BODY_RETRIES = 2
@@ -79,6 +86,14 @@ RETRY_DELAY_MS = 800
 LAZY_SCROLL_STEP_MS = 80
 MAX_LAZY_SCROLL_STEPS = 30
 MAX_RESOURCE_SIZE = 700 * 1024 * 1024
+CHUNK_LIMIT = 100
+MAX_CHUNK_ITERATIONS = 200
+CHUNK_CONCURRENCY = 4
+MAPS_SAVE_INTERVAL_SEC = 300
+MAPS_SAVE_EVERY_PAGES = 500
+MAX_RUNTIME_SEC = 5 * 3600  # 5h (margen sobre timeout de GitHub)
+STALL_FAILS_THRESHOLD = 30
+RECREATE_CTX_EVERY_PAGES = 1000
 
 IGNORED_SCHEMES = ("mailto:", "tel:", "javascript:", "data:", "blob:", "intent:", "about:")
 
@@ -128,10 +143,17 @@ errors = []
 visited_by_site = {}
 site_storage = {}
 
+MAPS_LOCK = asyncio.Lock()
+LAST_MAPS_SAVE = {"time": time.time(), "pages": 0}
+START_TIME = time.time()
 
-# ============================================================
-# FUNCIONES AUXILIARES (sin cambios, salvo is_allowed_page)
-# ============================================================
+
+def dedup_key(url):
+    if "#/b/" in url:
+        return url
+    return clean_url(url)
+
+
 def create_site_tracker(site):
     limit_mb = site.get("max_total_mb", 4096)
     return {
@@ -139,12 +161,28 @@ def create_site_tracker(site):
         "limite_bytes": int(limit_mb * 1024 * 1024),
         "bytes_guardados": 0,
         "archivos": {},
-        "limite_alcanzado": False
+        "limite_alcanzado": False,
+        "bytes_proxy": 0,
+        "bytes_direct": 0,
+        "requests_proxy": 0,
+        "requests_direct": 0,
     }
 
 
 def format_mb(byte_count):
     return round(byte_count / 1024 / 1024, 2)
+
+
+def register_transfer(bytes_count, via):
+    tracker = CURRENT_TRACKER["ref"]
+    if not tracker:
+        return
+    if via == "proxy":
+        tracker["bytes_proxy"] += bytes_count
+        tracker["requests_proxy"] += 1
+    elif via == "direct":
+        tracker["bytes_direct"] += bytes_count
+        tracker["requests_direct"] += 1
 
 
 def save_limited_file(path, data, tracker, description="archivo"):
@@ -153,20 +191,12 @@ def save_limited_file(path, data, tracker, description="archivo"):
     new_size = len(data)
     previous_size = tracker["archivos"].get(key, 0)
     difference = new_size - previous_size
-
     if difference > 0:
         available = tracker["limite_bytes"] - tracker["bytes_guardados"]
         if difference > available:
             tracker["limite_alcanzado"] = True
-            print(
-                "\n[ LIMITE ALCANZADO ]"
-                f"\nArchivo: {description}"
-                f"\nTamaño: {format_mb(new_size)} MB"
-                f"\nGuardado: {format_mb(tracker['bytes_guardados'])} MB"
-                f"\nLímite: {tracker['limite_mb']} MB"
-            )
+            print(f"\n[ LIMITE ALCANZADO ] {description}")
             return False
-
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     tracker["archivos"][key] = new_size
@@ -174,7 +204,7 @@ def save_limited_file(path, data, tracker, description="archivo"):
     return True
 
 
-def clean_url(url):
+def clean_url_with_hash(url):
     if not url:
         return ""
     try:
@@ -203,9 +233,16 @@ def clean_url(url):
 
         path = re.sub(r"%([0-9a-fA-F]{2})", normalize_escape, path)
         query = re.sub(r"%([0-9a-fA-F]{2})", lambda m: "%" + m.group(1).upper(), parts.query)
-        return urlunsplit((scheme, netloc, path, query, ""))
+        return urlunsplit((scheme, netloc, path, query, parts.fragment))
     except Exception:
         return ""
+
+
+def clean_url(url):
+    result = clean_url_with_hash(url)
+    if "#" in result:
+        return result.split("#", 1)[0]
+    return result
 
 
 def is_internal(url, site):
@@ -216,36 +253,27 @@ def is_internal(url, site):
 
 
 def is_allowed_page(url, site):
-    """Filtra por host, rutas permitidas/excluidas y, para reader.html, por lang=es."""
     if not is_internal(url, site):
         return False
     try:
         parts = urlsplit(url)
         path = parts.path or "/"
-
-        # Exclusiones primero
         for prefix in site.get("exclude_paths", []):
             prefix = str(prefix).rstrip("/") or "/"
             if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
                 return False
-
-        # Regla especial para reader.html: solo lang=es
         if path == "/reader.html":
             qs = parse_qs(parts.query)
             lang = qs.get("lang", [None])[0]
             if lang != "es":
                 return False
-            # Si pasa el filtro de lang, lo permitimos (ya está en allowed_paths)
-
         allowed_paths = site.get("allowed_paths")
         if not allowed_paths:
             return True
-
         for prefix in allowed_paths:
             prefix = str(prefix).rstrip("/") or "/"
             if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
                 return True
-
         return False
     except Exception:
         return False
@@ -322,7 +350,7 @@ def sanitize_path_component(value, max_length=150):
 
 
 def reserve_local_path(url, path):
-    url = clean_url(url)
+    url = clean_url_with_hash(url)
     path = Path(path)
     original = path
     digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
@@ -358,11 +386,14 @@ def safe_local_path(url, force_html=False, content_type=None):
         relative = relative.with_suffix(extension)
     if parts.query:
         relative = relative.with_name(relative.stem + query_suffix(parts.query) + relative.suffix)
+    if parts.fragment:
+        frag_hash = hashlib.sha1(parts.fragment.encode("utf-8")).hexdigest()[:10]
+        relative = relative.with_name(relative.stem + "__h_" + frag_hash + relative.suffix)
     return reserve_local_path(url, ROOT / relative)
 
 
 def register_url(url, path, is_page=False):
-    url = clean_url(url)
+    url = clean_url_with_hash(url)
     if not url:
         return
     path = Path(path)
@@ -373,7 +404,6 @@ def register_url(url, path, is_page=False):
         page_urls.add(url)
 
 
-# (normalize_existing_paths, audit_artifact_paths, save_json, load_previous_maps, infer_old_pages se mantienen igual)
 def normalize_existing_paths():
     if not ROOT.exists():
         return
@@ -390,7 +420,6 @@ def normalize_existing_paths():
         try:
             old.rename(new)
             moved[str(old)] = new
-            print("Ruta anterior normalizada:", old, "->", new)
         except Exception as exc:
             errors.append(f"NORMALIZAR RUTA | {old} | {exc}")
     if moved:
@@ -435,13 +464,10 @@ def audit_artifact_paths():
             collisions.setdefault(key, [seen[key]]).append(str(relative))
         else:
             seen[key] = str(relative)
-    print("Auditoría de rutas: archivos/carpetas inválidos =", len(invalid), "| colisiones =", len(collisions))
+    print("Auditoría: inválidos =", len(invalid), "| colisiones =", len(collisions))
     if invalid:
         for item in invalid[:30]:
             errors.append(f"RUTA NO PORTABLE | {item}")
-    if collisions:
-        for key, paths in collisions.items():
-            errors.append(f"COLISIÓN DE RUTA | {key} | {paths}")
     return not invalid and not collisions
 
 
@@ -449,6 +475,29 @@ def save_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         json.dump(data, file, ensure_ascii=False, indent=2)
+
+
+def save_maps_now():
+    url_map = {}
+    for url, path in url_to_file.items():
+        try:
+            url_map[url] = str(Path(path).relative_to(ROOT)).replace(os.sep, "/")
+        except ValueError:
+            continue
+    save_json(URL_MAP_FILE, url_map)
+    save_json(PAGE_MAP_FILE, sorted(page_urls))
+
+
+async def maybe_save_maps(pages_saved):
+    async with MAPS_LOCK:
+        now = time.time()
+        elapsed = now - LAST_MAPS_SAVE["time"]
+        pages_since = pages_saved - LAST_MAPS_SAVE["pages"]
+        if elapsed >= MAPS_SAVE_INTERVAL_SEC or pages_since >= MAPS_SAVE_EVERY_PAGES:
+            save_maps_now()
+            LAST_MAPS_SAVE["time"] = now
+            LAST_MAPS_SAVE["pages"] = pages_saved
+            print(f"      [Mapas] Guardado intermedio (páginas={pages_saved})")
 
 
 def load_previous_maps():
@@ -459,60 +508,205 @@ def load_previous_maps():
                 path = ROOT / relative
                 if path.exists():
                     register_url(url, path)
-            print("URLs recuperadas del mapa anterior:", len(url_to_file))
+            print("URLs recuperadas:", len(url_to_file))
         except Exception as exc:
-            print("Error recuperando mapa anterior:", exc)
+            print("Error recuperando mapa:", exc)
     if PAGE_MAP_FILE.exists():
         try:
             data = json.loads(PAGE_MAP_FILE.read_text(encoding="utf-8"))
             for url in data:
-                page_urls.add(clean_url(url))
+                page_urls.add(clean_url_with_hash(url))
         except Exception as exc:
-            print("Error recuperando mapa de páginas:", exc)
+            print("Error recuperando páginas:", exc)
 
 
-def infer_old_pages():
-    if not ROOT.exists():
-        return
-    known_hosts = set()
-    for site in SITES:
-        known_hosts.update(site["hosts"])
-    for old_file in list(ROOT.rglob("*.bin")):
-        if "_metadata" in old_file.parts: continue
+# ============================================================
+# FETCH HÍBRIDO CON CACHE Y CONTADORES
+# ============================================================
+async def fetch_bytes(url, prefer_direct=True):
+    existing = url_to_file.get(url)
+    if existing and Path(existing).is_file():
         try:
-            data = old_file.read_bytes()
-            if not looks_like_html(data): continue
-            new_file = old_file.with_suffix(".html")
-            if new_file.exists(): continue
-            old_file.rename(new_file)
-            print("HTML recuperado:", old_file, "->", new_file)
-        except Exception as exc:
-            errors.append(f"RECUPERAR BIN | {old_file} | {exc}")
-    for html_file in ROOT.rglob("*.html"):
-        if "_metadata" in html_file.parts: continue
-        try:
-            relative = html_file.relative_to(ROOT)
-        except ValueError:
+            return Path(existing).read_bytes(), "cached"
+        except Exception:
+            pass
+
+    order = ["direct", "proxy"] if prefer_direct else ["proxy", "direct"]
+    for ctx_name in order:
+        ctx = CONTEXTS.get(ctx_name)
+        if not ctx:
             continue
-        if len(relative.parts) < 2: continue
-        host = relative.parts[0]
-        if host not in known_hosts: continue
-        web_path = "/" + "/".join(relative.parts[1:])
-        if web_path.lower() == "/index.html":
-            register_url("https://" + host + "/", html_file, is_page=True)
-            register_url("https://" + host + "/index.html", html_file, is_page=True)
-        elif web_path.lower().endswith("/index.html"):
-            directory = web_path[:-10]
-            if not directory.endswith("/"): directory += "/"
-            register_url("https://" + host + directory, html_file, is_page=True)
-            register_url("https://" + host + web_path, html_file, is_page=True)
+        try:
+            response = await ctx.request.get(url, timeout=60000)
+            if response.ok:
+                body = await response.body()
+                if body:
+                    if ctx_name in ("proxy", "direct"):
+                        register_transfer(len(body), ctx_name)
+                    return body, ctx_name
+        except Exception:
+            continue
+    return None, None
+
+
+def save_fetched(data, url, tracker, content_type=None, description=None):
+    if not data:
+        return None
+    ext = detect_extension(url, content_type, data)
+    path = safe_local_path(url, content_type=content_type)
+    if path.suffix.lower() != ext:
+        path = reserve_local_path(url, path.with_suffix(ext))
+    if save_limited_file(path, data, tracker, description=description or url):
+        register_url(url, path)
+        asset_urls.add(url)
+        return path
+    return None
+
+
+# ============================================================
+# VALIDACIÓN DE CHUNKS (detección de "falso vacío")
+# ============================================================
+def chunk_has_data(data_bytes, type_):
+    if not data_bytes:
+        return False
+    try:
+        obj = json.loads(data_bytes)
+    except Exception:
+        return False
+    if not isinstance(obj, dict):
+        return False
+    if type_ == "toc":
+        return obj.get("realMax", 0) > 0
+    for k, v in obj.items():
+        if isinstance(v, list) and len(v) > 0:
+            return True
+    return False
+
+
+# ============================================================
+# AUDIOLIBROS
+# ============================================================
+async def process_audiobook(site, tracker, book_id):
+    json_url = f"https://ponn.io/audiobooks/data/books/{book_id}.json"
+    data, ctx_used = await fetch_bytes(json_url, prefer_direct=False)
+    if not data:
+        errors.append(f"AUDIOBOOK JSON | {book_id} | no descargado")
+        return 0
+
+    save_fetched(data, json_url, tracker, content_type="application/json")
+    print(f"      [Audio] JSON ({ctx_used}): {book_id}")
+
+    try:
+        meta = json.loads(data)
+    except Exception:
+        errors.append(f"AUDIOBOOK JSON PARSE | {book_id}")
+        return 0
+
+    base_url = meta.get("baseUrl", "")
+    chapters = meta.get("chapters", [])
+    if not base_url or not chapters:
+        errors.append(f"AUDIOBOOK SIN CAPÍTULOS | {book_id}")
+        return 0
+
+    count = 0
+    for ch in chapters:
+        file = ch.get("file")
+        if not file:
+            continue
+        mp3_url = base_url + file
+        mp3_data, _ = await fetch_bytes(mp3_url, prefer_direct=True)
+        if mp3_data:
+            p = save_fetched(mp3_data, mp3_url, tracker, content_type="audio/mpeg")
+            if p:
+                count += 1
         else:
-            inferred_path = web_path[:-5] if web_path.lower().endswith(".html") else web_path
-            register_url("https://" + host + inferred_path, html_file, is_page=True)
-            register_url("https://" + host + inferred_path + ".html", html_file, is_page=True)
+            errors.append(f"MP3 FALLO | {mp3_url}")
+
+    cover_url = f"https://ponn.io/sandbox/audiolab/covers-sq/{book_id}.jpg"
+    cover_data, _ = await fetch_bytes(cover_url, prefer_direct=False)
+    if cover_data:
+        save_fetched(cover_data, cover_url, tracker, content_type="image/jpeg")
+
+    print(f"      [Audio] {book_id}: {count}/{len(chapters)} MP3")
+    return count
 
 
-# (save_response_resource, extract_page_links, is_probable_page, expand_load_more, crawl_site se mantienen igual)
+# ============================================================
+# READERS CON CONCURRENCIA ×4
+# ============================================================
+async def fetch_and_save_chunk(url, book_id, lang, type_, from_, semaphore, tracker):
+    async with semaphore:
+        data, _ = await fetch_bytes(url, prefer_direct=True)
+        if not data:
+            errors.append(f"CHUNK VACÍO | {book_id} | {lang} | {type_} | from={from_}")
+            return 0
+        if not chunk_has_data(data, type_):
+            errors.append(f"CHUNK SIN DATOS | {book_id} | {lang} | {type_} | from={from_}")
+            return 0
+        p = save_fetched(data, url, tracker, content_type="application/json")
+        return 1 if p else 0
+
+
+async def process_reader(site, tracker, book_id):
+    if not book_id:
+        return 0
+
+    toc_url = f"https://getbookchunk-ab3uqz2diq-ew.a.run.app/?bookId={book_id}&lang=es&type=toc&from=1&access=free"
+    toc_data, _ = await fetch_bytes(toc_url, prefer_direct=True)
+    real_max = 0
+    if toc_data:
+        save_fetched(toc_data, toc_url, tracker, content_type="application/json")
+        try:
+            toc = json.loads(toc_data)
+            real_max = toc.get("realMax", 0)
+            chapters_count = len(toc.get("chapters", []))
+            if real_max == 0:
+                errors.append(f"READER SIN TEXTO (realMax=0) | {book_id}")
+                return 0
+        except Exception as e:
+            errors.append(f"READER TOC PARSE | {book_id} | {e}")
+            return 0
+    if real_max <= 0:
+        return 0
+
+    print(f"      [Reader] {book_id}: realMax={real_max}")
+
+    semaphore = asyncio.Semaphore(CHUNK_CONCURRENCY)
+    tasks = []
+    for lang in ["en", "es"]:
+        for type_ in ["sentences", "phrases"]:
+            start = 1
+            iterations = 0
+            while start <= real_max and iterations < MAX_CHUNK_ITERATIONS:
+                url = (f"https://getbookchunk-ab3uqz2diq-ew.a.run.app/?"
+                       f"bookId={book_id}&lang={lang}&type={type_}"
+                       f"&from={start}&limit={CHUNK_LIMIT}&access=free")
+                tasks.append(fetch_and_save_chunk(url, book_id, lang, type_, start, semaphore, tracker))
+                start += CHUNK_LIMIT
+                iterations += 1
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    total_chunks = sum(1 for r in results if isinstance(r, int) and r > 0)
+
+    # reader-audio partN (secuencial, son pocos)
+    n = 1
+    parts_ok = 0
+    while n <= 100:
+        url = f"https://ponn.io/sandbox/reader-audio/acc/{book_id}/part{n}.json"
+        data, _ = await fetch_bytes(url, prefer_direct=True)
+        if not data or len(data) < 10:
+            break
+        if save_fetched(data, url, tracker, content_type="application/json"):
+            parts_ok += 1
+        n += 1
+
+    print(f"      [Reader] {book_id}: {total_chunks} chunks + {parts_ok} parts")
+    return total_chunks
+
+
+# ============================================================
+# LISTENER DE RECURSOS
+# ============================================================
 async def save_response_resource(response, site, tracker):
     url = ""
     try:
@@ -534,7 +728,6 @@ async def save_response_resource(response, site, tracker):
             if length:
                 try:
                     if int(length) > MAX_RESOURCE_SIZE:
-                        print("Recurso individual demasiado grande:", url)
                         return
                 except ValueError:
                     pass
@@ -543,17 +736,12 @@ async def save_response_resource(response, site, tracker):
                 try:
                     data = await response.body()
                     if data: break
-                except Exception as body_exc:
-                    if body_attempt >= RESOURCE_BODY_RETRIES: raise body_exc
+                except Exception:
+                    if body_attempt >= RESOURCE_BODY_RETRIES: raise
                     await asyncio.sleep(0.25 * body_attempt)
             if not data or len(data) > MAX_RESOURCE_SIZE or looks_like_html(data): return
-            extension = detect_extension(url, content_type, data)
-            path = safe_local_path(url, content_type=content_type)
-            if path.suffix.lower() != extension:
-                path = reserve_local_path(url, path.with_suffix(extension))
-            if not save_limited_file(path, data, tracker, description=url): return
-            register_url(url, path)
-            asset_urls.add(url)
+            register_transfer(len(data), "proxy")
+            save_fetched(data, url, tracker, content_type=content_type)
     except Exception as exc:
         errors.append(f"RECURSO | {url or response.url} | {exc}")
 
@@ -574,12 +762,20 @@ async def extract_page_links(page, current_url, site):
             if not value: continue
             value = value.strip()
             if value.startswith(IGNORED_SCHEMES): continue
-            absolute = clean_url(urljoin(current_url, value))
+            absolute_raw = urljoin(current_url, value)
+            preserve = False
+            try:
+                p = urlsplit(absolute_raw)
+                if p.hostname in site["hosts"] and p.path == "/audiobooks/" and p.fragment:
+                    preserve = True
+            except Exception:
+                pass
+            absolute = clean_url_with_hash(absolute_raw) if preserve else clean_url(absolute_raw)
             if not absolute: continue
             if not is_allowed_page(absolute, site): continue
             results.append(absolute)
     except Exception as exc:
-        errors.append(f"EXTRACCION ENLACES | {current_url} | {exc}")
+        errors.append(f"EXTRACCION | {current_url} | {exc}")
     return list(dict.fromkeys(results))
 
 
@@ -589,116 +785,89 @@ def is_probable_page(url):
 
 
 async def expand_load_more(page, site):
-    print(f"   [Expand] Iniciando expansión de 'Cargar más' para: {site['name']}")
+    print(f"   [Expand] Expandiendo 'Cargar más'...")
     clicks = 0
     without_changes = 0
     max_clicks = site.get("max_load_more_clicks", 100)
     selector_boton = "button, a, [role='button']"
-
     while clicks < max_clicks:
         try:
             boton = page.locator(selector_boton).filter(
                 has_text=re.compile(r"(load\s*more|cargar\s*más|ver\s*más|show\s*more)", re.IGNORECASE)
             ).first
-
             if await boton.count() == 0:
-                print("   [Expand] No se encontró botón de 'Cargar más'.")
                 break
             if not await boton.is_visible() or not await boton.is_enabled():
-                print("   [Expand] Botón no visible o deshabilitado.")
                 break
-
             previous_links = set(
-                await page.locator("a[href]").evaluate_all(
-                    "elements => elements.map(el => el.href).filter(Boolean)"
-                )
+                await page.locator("a[href]").evaluate_all("elements => elements.map(el => el.href).filter(Boolean)")
             )
-
             await boton.click()
             clicks += 1
-            print(f"   [Expand] Clic {clicks} realizado.")
-
             await page.wait_for_timeout(1500)
             current_links = set(
-                await page.locator("a[href]").evaluate_all(
-                    "elements => elements.map(el => el.href).filter(Boolean)"
-                )
+                await page.locator("a[href]").evaluate_all("elements => elements.map(el => el.href).filter(Boolean)")
             )
-            new_links = current_links - previous_links
-
-            if new_links:
+            if current_links - previous_links:
                 without_changes = 0
-                print(f"   [Expand]   -> {len(new_links)} enlaces nuevos detectados.")
             else:
-                await page.wait_for_timeout(2000)
-                current_links = set(
-                    await page.locator("a[href]").evaluate_all(
-                        "elements => elements.map(el => el.href).filter(Boolean)"
-                    )
-                )
-                new_links = current_links - previous_links
-                if new_links:
-                    without_changes = 0
-                    print(f"   [Expand]   -> {len(new_links)} enlaces nuevos (tras espera extra).")
-                else:
-                    without_changes += 1
-                    print(f"   [Expand]   -> Sin cambios ({without_changes}/2).")
-
-            if without_changes >= 2:
-                print("   [Expand] Detenido: no aparecen más enlaces nuevos.")
-                break
-
-        except PlaywrightTimeoutError:
-            print("   [Expand] Tiempo de espera agotado al interactuar con el botón.")
+                without_changes += 1
+                if without_changes >= 2:
+                    break
+        except Exception:
             break
-        except Exception as exc:
-            print(f"   [Expand] Error: {exc}")
-            errors.append(f"LOAD_MORE | {site['name']} | {exc}")
-            break
-
-    print(f"   [Expand] Expansión terminada. Clics realizados: {clicks}")
+    print(f"   [Expand] Terminado. Clics: {clicks}")
     return clicks
 
 
-async def crawl_site(browser, site):
+# ============================================================
+# WATCHDOG: recrear contextos y comprobar tiempo
+# ============================================================
+async def recreate_contexts(browser, base_kwargs):
+    print("   [Watchdog] Recreando contextos (limpieza de conexiones)...")
+    try:
+        if CONTEXTS["proxy"]:
+            await CONTEXTS["proxy"].close()
+    except Exception:
+        pass
+    try:
+        if CONTEXTS["direct"]:
+            await CONTEXTS["direct"].close()
+    except Exception:
+        pass
+    CONTEXTS["proxy"] = await browser.new_context(proxy=PROXY_CONFIG, **base_kwargs)
+    CONTEXTS["proxy"].set_default_navigation_timeout(NAVIGATION_TIMEOUT)
+    CONTEXTS["proxy"].set_default_timeout(15000)
+    CONTEXTS["direct"] = await browser.new_context(**base_kwargs)
+    print("   [Watchdog] Contextos recreados.")
+
+
+def runtime_exceeded():
+    return (time.time() - START_TIME) > MAX_RUNTIME_SEC
+
+
+# ============================================================
+# CRAWL
+# ============================================================
+async def crawl_site(browser, site, base_kwargs):
     print("\n" + "=" * 65)
     print("SITIO:", site["name"])
-    print("INICIO:", site["start"])
-    print("LÍMITE TOTAL:", site.get("max_total_mb", 2048), "MB")
-    print("LÍMITE POR ARCHIVO:", format_mb(MAX_RESOURCE_SIZE), "MB")
-    print("PÁGINAS SIMULTÁNEAS:", PAGE_WORKERS)
-    print("INTENTOS MÁXIMOS POR PÁGINA:", MAX_PAGE_ATTEMPTS)
-    use_proxy = site.get("use_proxy", False)
-    print("PROXY:", "ACTIVADO" if use_proxy else "desactivado")
     print("=" * 65)
 
     tracker = create_site_tracker(site)
     site_storage[site["name"]] = tracker
+    CURRENT_TRACKER["ref"] = tracker
 
-    context_kwargs = dict(
-        ignore_https_errors=True,
-        viewport={"width": 1920, "height": 1080},
-        locale="es-ES",
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        extra_http_headers={
-            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-        }
-    )
-    if use_proxy:
-        context_kwargs["proxy"] = PROXY_CONFIG
-        print(f"   [Proxy] Usando: {PROXY_CONFIG['server']} (usuario: {PROXY_CONFIG['username']})")
+    print("   [Catálogo] Descargando JSONs iniciales...")
+    for seed_url in CATALOG_SEEDS:
+        data, ctx_used = await fetch_bytes(seed_url, prefer_direct=False)
+        if data:
+            save_fetched(data, seed_url, tracker)
+            print(f"   [Catálogo] {seed_url.split('/')[-1]} ({ctx_used})")
 
-    context = await browser.new_context(**context_kwargs)
-    context.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
-    context.set_default_timeout(15000)
+    ctx_proxy = CONTEXTS["proxy"]
+    ctx_proxy.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
+    ctx_proxy.set_default_timeout(15000)
 
     starts = site.get("starts", [site["start"]])
     initial_urls = list(dict.fromkeys(clean_url(url) for url in starts if clean_url(url)))
@@ -714,9 +883,10 @@ async def crawl_site(browser, site):
     retry_count = 0
     pages_saved = 0
     resource_tasks = set()
+    consecutive_fails = {"count": 0}
+    pages_since_ctx_recreate = {"count": 0}
 
-    worker_count = PAGE_WORKERS
-    pages = [await context.new_page() for _ in range(worker_count)]
+    pages = [await ctx_proxy.new_page() for _ in range(PAGE_WORKERS)]
 
     def attach_resource_listener(page):
         def on_response(response):
@@ -731,6 +901,9 @@ async def crawl_site(browser, site):
     async def worker(worker_id, page):
         nonlocal pages_saved, retry_count
         while True:
+            if runtime_exceeded():
+                print("   [Watchdog] Tiempo máximo alcanzado, deteniendo worker.")
+                return
             item = await queue.get()
             current_url = ""
             depth = 0
@@ -738,13 +911,18 @@ async def crawl_site(browser, site):
             eligible_for_retry = False
             success = False
             claimed = False
+            key = None
 
             try:
                 if item is None:
                     return
                 current_url, depth, attempt = item
-                current_url = clean_url(current_url)
-                if not current_url or current_url in visited or current_url in in_progress:
+                current_url = clean_url_with_hash(current_url)
+                key = dedup_key(current_url)
+
+                if not current_url or key in in_progress:
+                    continue
+                if key in visited and "#/b/" not in current_url:
                     continue
                 if depth > MAX_DEPTH:
                     continue
@@ -753,15 +931,43 @@ async def crawl_site(browser, site):
                 if not is_allowed_page(current_url, site) or not is_probable_page(current_url):
                     continue
 
-                in_progress.add(current_url)
+                in_progress.add(key)
                 claimed = True
                 eligible_for_retry = True
 
-                print(f"[{site['name']}] [W{worker_id}] ({pages_saved + 1}/{MAX_PAGES_PER_SITE}) Intento {attempt}/{MAX_PAGE_ATTEMPTS}: {current_url}")
+                print(f"[{site['name']}] [W{worker_id}] ({pages_saved+1}) Intento {attempt}: {current_url}")
+
+                # FLASHCARDS
+                if current_url.startswith("https://ponn.io/es/flashcards"):
+                    for tab in ["sets", "mine", "practice"]:
+                        try:
+                            await page.goto(f"https://ponn.io/es/flashcards/?learn=en#{tab}",
+                                            wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
+                            await page.wait_for_timeout(2500)
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=3000)
+                            except PlaywrightTimeoutError:
+                                pass
+                            html = await page.content()
+                            if looks_like_html(html.encode("utf-8")):
+                                local_file = ROOT / "ponn.io" / "es" / "flashcards" / f"index__{tab}.html"
+                                save_limited_file(local_file, html.encode("utf-8"), tracker, description=f"flashcards_{tab}")
+                                register_url(f"https://ponn.io/es/flashcards/?learn=en#{tab}", local_file, is_page=True)
+                                pages_saved += 1
+                                print(f"   [Flashcards] Guardada: {tab}")
+                        except Exception as e:
+                            errors.append(f"FLASHCARDS {tab} | {e}")
+                    visited.add(current_url)
+                    visited.add(clean_url(current_url))
+                    success = True
+                    consecutive_fails["count"] = 0
+                    continue
 
                 navigation_timed_out = False
                 response = None
-                previous_page_url = clean_url(page.url)
+                previous_browser_url = clean_url(page.url)
+                has_hash = "#" in current_url
+                base_url = current_url.split("#", 1)[0] if has_hash else current_url
 
                 for nav_attempt in range(1, NAVIGATION_RETRIES + 1):
                     try:
@@ -771,7 +977,6 @@ async def crawl_site(browser, site):
                             await page.wait_for_timeout(RETRY_DELAY_MS)
                             continue
                         navigation_timed_out = True
-                        errors.append(f"TIMEOUT NAVEGACIÓN | {current_url}")
                         response = None
                         break
                     if (response is not None and response.status in (429, 500, 502, 503, 504) and nav_attempt < NAVIGATION_RETRIES):
@@ -781,117 +986,100 @@ async def crawl_site(browser, site):
 
                 if response is not None and response.status >= 400:
                     errors.append(f"HTTP {response.status} | {current_url}")
+                    consecutive_fails["count"] += 1
                     continue
                 if response is None:
-                    current_browser_url = clean_url(page.url)
-                    if (not navigation_timed_out or current_browser_url in ("", clean_url("about:blank")) or current_browser_url == previous_page_url):
-                        continue
+                    consecutive_fails["count"] += 1
+                    continue
 
                 try:
                     await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
                 except PlaywrightTimeoutError:
                     pass
 
-                try:
-                    lazy_count = await page.locator('img[loading="lazy"], img[data-src], img[data-lazy-src]').count()
-                    if lazy_count:
-                        await page.evaluate("""
-                            () => {
-                                document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy-src]').forEach(img => {
-                                    img.loading = 'eager';
-                                    if (!img.src && img.dataset.src) img.src = img.dataset.src;
-                                    if (!img.src && img.dataset.lazySrc) img.src = img.dataset.lazySrc;
-                                });
-                            }
-                        """)
-                        await page.evaluate("""async (maxSteps, delay) => {
-                            const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-                            const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-                            const step = Math.max(window.innerHeight, Math.ceil(height / maxSteps));
-                            for (let y = 0, n = 0; y < height && n < maxSteps; y += step, n++) {
-                                window.scrollTo(0, y);
-                                await pause(delay);
-                            }
-                            window.scrollTo(0, 0);
-                        }""", MAX_LAZY_SCROLL_STEPS, LAZY_SCROLL_STEP_MS)
-                        await page.wait_for_timeout(300)
-                    else:
-                        await page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
-                except Exception:
-                    await page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
+                if has_hash and previous_browser_url == base_url:
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
+                        await page.wait_for_timeout(2000)
+                    except Exception:
+                        pass
+
+                if "/audiobooks/" in current_url and "#/b/" in current_url:
+                    book_id = current_url.split("#/b/")[1].split("&")[0].split("?")[0]
+                    await process_audiobook(site, tracker, book_id)
+
+                if "/reader.html" in current_url:
+                    qs = parse_qs(urlsplit(current_url).query)
+                    book_id = qs.get("id", [""])[0]
+                    if book_id:
+                        await process_reader(site, tracker, book_id)
 
                 try:
-                    await page.locator("details").evaluate_all("elements => elements.forEach(el => el.open = true)")
+                    await page.evaluate("""async (maxSteps, delay) => {
+                        const pause = ms => new Promise(r => setTimeout(r, ms));
+                        const h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+                        const step = Math.max(window.innerHeight, Math.ceil(h / maxSteps));
+                        for (let y = 0, n = 0; y < h && n < maxSteps; y += step, n++) {
+                            window.scrollTo(0, y);
+                            await pause(delay);
+                        }
+                        window.scrollTo(0, 0);
+                    }""", MAX_LAZY_SCROLL_STEPS, LAZY_SCROLL_STEP_MS)
+                    await page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
                 except Exception:
                     pass
 
                 if site.get("expand_load_more", False):
                     await expand_load_more(page, site)
 
-                final_url = clean_url(page.url) or current_url
-                if not is_allowed_page(final_url, site):
-                    errors.append(f"REDIRECCIÓN FUERA DE RUTA | {current_url} -> {final_url}")
-                    eligible_for_retry = False
-                    continue
-
+                final_url = clean_url_with_hash(page.url) or current_url
                 html = await page.content()
                 html_bytes = html.encode("utf-8", errors="replace")
                 if not looks_like_html(html_bytes):
-                    errors.append(f"NO HTML | {current_url}")
-                    continue
-
-                if pages_saved >= MAX_PAGES_PER_SITE or tracker["limite_alcanzado"]:
-                    eligible_for_retry = False
                     continue
 
                 local_file = safe_local_path(final_url, force_html=True, content_type="text/html")
-                if not save_limited_file(local_file, html_bytes, tracker, description=final_url):
-                    eligible_for_retry = False
-                    continue
+                if save_limited_file(local_file, html_bytes, tracker, description=final_url):
+                    register_url(current_url, local_file, is_page=True)
+                    register_url(final_url, local_file, is_page=True)
+                    visited.add(key)
+                    visited.add(clean_url(current_url))
+                    pages_saved += 1
+                    success = True
+                    consecutive_fails["count"] = 0
+                    pages_since_ctx_recreate["count"] += 1
+                    print(f"   Guardada: {pages_saved} | disco: {format_mb(tracker['bytes_guardados'])} MB | "
+                          f"proxy: {format_mb(tracker['bytes_proxy'])} MB | directo: {format_mb(tracker['bytes_direct'])} MB")
+                    await maybe_save_maps(pages_saved)
 
-                register_url(current_url, local_file, is_page=True)
-                register_url(final_url, local_file, is_page=True)
-                visited.add(current_url)
-                visited.add(final_url)
-                pages_saved += 1
-                success = True
-
-                print(f"   Guardada: {pages_saved} | Almacenamiento: {format_mb(tracker['bytes_guardados'])} / {tracker['limite_mb']} MB")
-
-                links = []
-                for link_attempt in range(1, 3):
-                    links = await extract_page_links(page, final_url, site)
-                    if links: break
-                    if link_attempt == 1: await asyncio.sleep(0.2)
-                if not links:
-                    errors.append(f"SIN ENLACES EXTRAÍDOS O PÁGINA SIN ENLACES | {final_url}")
-
+                links = await extract_page_links(page, final_url, site)
                 for link in links:
-                    if link in queued or link in visited or link in in_progress: continue
+                    link_key = dedup_key(link)
+                    if link_key in queued or link_key in visited or link_key in in_progress:
+                        continue
                     if is_probable_page(link):
-                        queued.add(link)
+                        queued.add(link_key)
                         queue.put_nowait((link, depth + 1, 1))
 
             except PlaywrightTimeoutError:
                 errors.append(f"TIMEOUT | {current_url}")
+                consecutive_fails["count"] += 1
             except Exception as exc:
                 errors.append(f"PAGINA | {current_url} | {exc}")
+                consecutive_fails["count"] += 1
             finally:
-                if claimed:
-                    in_progress.discard(current_url)
+                if claimed and key:
+                    in_progress.discard(key)
                 if eligible_for_retry and not success and current_url:
                     if attempt < MAX_PAGE_ATTEMPTS and not tracker["limite_alcanzado"]:
                         retry_count += 1
-                        delay = RETRY_DELAY_MS * attempt
-                        print(f"   Reintentando página ({attempt + 1}/{MAX_PAGE_ATTEMPTS}) en {delay} ms: {current_url}")
-                        await asyncio.sleep(delay / 1000)
+                        await asyncio.sleep(RETRY_DELAY_MS * attempt / 1000)
                         queue.put_nowait((current_url, depth, attempt + 1))
                     else:
                         failed_pages[current_url] = attempt
-                        errors.append(f"PÁGINA FALLIDA DEFINITIVA | intentos={attempt} | {current_url}")
                 queue.task_done()
 
-    workers = [asyncio.create_task(worker(index + 1, page)) for index, page in enumerate(pages)]
+    workers = [asyncio.create_task(worker(i + 1, p)) for i, p in enumerate(pages)]
     await queue.join()
     for _ in workers:
         queue.put_nowait(None)
@@ -908,56 +1096,51 @@ async def crawl_site(browser, site):
     visited_by_site[site["name"]] = {
         "paginas_guardadas": pages_saved,
         "urls_descubiertas": len(queued),
-        "paginas_completadas": len(visited),
         "paginas_fallidas_definitivas": len(failed_pages),
         "reintentos_de_pagina": retry_count,
-        "detalle_fallidas": failed_pages,
         "almacenamiento_MB": format_mb(tracker["bytes_guardados"]),
+        "proxy_MB": format_mb(tracker["bytes_proxy"]),
+        "directo_MB": format_mb(tracker["bytes_direct"]),
+        "requests_proxy": tracker["requests_proxy"],
+        "requests_direct": tracker["requests_direct"],
         "limite_MB": tracker["limite_mb"],
         "limite_alcanzado": tracker["limite_alcanzado"],
-        "trabajadores_simultaneos": worker_count,
-        "proxy_usado": use_proxy,
     }
-
-    await context.close()
 
     print("\n" + "-" * 55)
     print("FINALIZADO:", site["name"])
     print("Páginas guardadas:", pages_saved)
-    print("URLs descubiertas:", len(queued))
-    print("Páginas fallidas definitivas:", len(failed_pages))
-    print("Reintentos de página:", retry_count)
-    print("Almacenamiento:", format_mb(tracker["bytes_guardados"]), "MB de", tracker["limite_mb"], "MB")
-    print("Límite alcanzado:", "SÍ" if tracker["limite_alcanzado"] else "NO")
+    print("Disco:", format_mb(tracker["bytes_guardados"]), "MB")
+    print("Proxy:", format_mb(tracker["bytes_proxy"]), "MB |", tracker["requests_proxy"], "req")
+    print("Directo:", format_mb(tracker["bytes_direct"]), "MB |", tracker["requests_direct"], "req")
     print("-" * 55)
 
 
-# (find_local_target, relative_target, rewrite_html, rewrite_css, save_maps, create_offline_index, create_report se mantienen igual)
+# ============================================================
+# REESCRITURA, ÍNDICE, INFORME
+# ============================================================
 @lru_cache(maxsize=500000)
 def find_local_target(url):
-    url = clean_url(url)
+    url = clean_url_with_hash(url)
     if not url: return None
     candidates = [url]
+    base = url.split("#", 1)[0]
+    if base != url: candidates.append(base)
     parts = urlsplit(url)
-    without_query = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    without_query = urlunsplit((parts.scheme, parts.netloc, parts.path, "", parts.fragment))
     if without_query not in candidates: candidates.append(without_query)
     path = parts.path or "/"
     if path.endswith("/"):
-        candidates.append(urlunsplit((parts.scheme, parts.netloc, path + "index.html", "", "")))
+        candidates.append(urlunsplit((parts.scheme, parts.netloc, path + "index.html", "", parts.fragment)))
     elif not Path(path).suffix:
-        candidates.append(urlunsplit((parts.scheme, parts.netloc, path + ".html", "", "")))
-    if not path.endswith("/") and not Path(path).suffix:
-        candidates.append(urlunsplit((parts.scheme, parts.netloc, path.rstrip("/") + "/index.html", "", "")))
+        candidates.append(urlunsplit((parts.scheme, parts.netloc, path + ".html", "", parts.fragment)))
     for candidate in candidates:
-        candidate = clean_url(candidate)
-        target = url_to_file.get(candidate)
+        target = url_to_file.get(clean_url_with_hash(candidate))
         if target and Path(target).exists(): return Path(target)
     for candidate in candidates:
-        candidate = clean_url(candidate)
-        if not candidate: continue
-        candidate_parts = urlsplit(candidate)
-        host = candidate_parts.hostname or ""
-        relative = unquote(candidate_parts.path or "/").lstrip("/")
+        cp = urlsplit(clean_url_with_hash(candidate))
+        host = cp.hostname or ""
+        relative = unquote(cp.path or "/").lstrip("/")
         if not relative or relative.endswith("/"): relative += "index.html"
         local = ROOT / host / relative
         if local.exists() and local.is_file(): return local
@@ -983,7 +1166,7 @@ def rewrite_html():
                     if value.startswith(IGNORED_SCHEMES) or value.startswith("#"): continue
                     absolute_with_fragment = urljoin(source_url, value)
                     parsed = urlsplit(absolute_with_fragment)
-                    absolute = clean_url(absolute_with_fragment)
+                    absolute = clean_url_with_hash(absolute_with_fragment)
                     if not absolute: continue
                     target = find_local_target(absolute)
                     if target:
@@ -1007,48 +1190,23 @@ def rewrite_html():
 
 def rewrite_css():
     url_pattern = re.compile(r"url\(\s*([\"']?)(.*?)\1\s*\)", re.IGNORECASE)
-    import_pattern = re.compile(r"@import\s+([\"'])(.*?)\1", re.IGNORECASE)
     for css_file in ROOT.rglob("*.css"):
         if "_metadata" in css_file.parts: continue
         source_url = file_to_url.get(str(css_file))
         if not source_url: continue
         try:
             content = css_file.read_text(encoding="utf-8", errors="replace")
-
             def replace_url(match):
                 raw = match.group(2).strip()
                 if not raw or raw.startswith(("data:", "blob:", "#")): return match.group(0)
                 absolute = clean_url(urljoin(source_url, raw))
                 target = find_local_target(absolute) if absolute else None
                 if not target: return match.group(0)
-                quote_char = match.group(1)
-                return "url(" + quote_char + relative_target(css_file, target) + quote_char + ")"
-
+                return "url(" + match.group(1) + relative_target(css_file, target) + match.group(1) + ")"
             content = url_pattern.sub(replace_url, content)
-
-            def replace_import(match):
-                raw = match.group(2).strip()
-                absolute = clean_url(urljoin(source_url, raw))
-                target = find_local_target(absolute) if absolute else None
-                if not target: return match.group(0)
-                quote_char = match.group(1)
-                return "@import " + quote_char + relative_target(css_file, target) + quote_char
-
-            content = import_pattern.sub(replace_import, content)
             css_file.write_text(content, encoding="utf-8")
         except Exception as exc:
             errors.append(f"REESCRITURA CSS | {css_file} | {exc}")
-
-
-def save_maps():
-    url_map = {}
-    for url, path in url_to_file.items():
-        try:
-            url_map[url] = str(Path(path).relative_to(ROOT)).replace(os.sep, "/")
-        except ValueError:
-            continue
-    save_json(URL_MAP_FILE, url_map)
-    save_json(PAGE_MAP_FILE, sorted(page_urls))
 
 
 def create_offline_index():
@@ -1059,89 +1217,39 @@ def create_offline_index():
             href = os.path.relpath(target, ROOT).replace(os.sep, "/")
             links.append(f'<li><a href="{href}">{site["name"]}</a></li>')
         else:
-            links.append(f'<li>{site["name"]} — página inicial no encontrada</li>')
-
-    html = '''<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Documentación offline</title>
-<style>
-body{font-family:Arial,sans-serif;max-width:900px;margin:40px auto;padding:20px;line-height:1.6;background:#f3f5f7;color:#222}
-main{background:white;padding:28px;border-radius:12px}
-li{margin:14px 0}
-a{color:#145db8;font-weight:bold}
-</style>
-</head>
-<body>
-<main>
-<h1>Documentación de programación offline</h1>
-<p>Selecciona el sitio que deseas consultar:</p>
-<ul>
-''' + "\n".join(links) + '''
-</ul>
-</main>
-</body>
-</html>'''
+            links.append(f'<li>{site["name"]} — no encontrada</li>')
+    html = f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Offline</title>
+<style>body{{font-family:Arial;max-width:900px;margin:40px auto;padding:20px;background:#f3f5f7}}
+main{{background:#fff;padding:28px;border-radius:12px}}a{{color:#145db8}}</style></head>
+<body><main><h1>Documentación offline</h1><ul>{"".join(links)}</ul></main></body></html>'''
     (ROOT / "INICIO_OFFLINE.html").write_text(html, encoding="utf-8")
 
 
 def create_report():
     files = [p for p in ROOT.rglob("*") if p.is_file()]
     total_bytes = sum(p.stat().st_size for p in files)
-    storage_report = []
-    for site in SITES:
-        name = site["name"]
-        tracker = site_storage.get(name, create_site_tracker(site))
-        used = tracker["bytes_guardados"]
-        limit = tracker["limite_bytes"]
-        storage_report.append({
-            "sitio": name,
-            "limite_MB": tracker["limite_mb"],
-            "descargado_MB": format_mb(used),
-            "disponible_MB": format_mb(max(0, limit - used)),
-            "porcentaje_usado": round(used / limit * 100, 2) if limit else 0,
-            "archivos_guardados": len(tracker["archivos"]),
-            "limite_alcanzado": tracker["limite_alcanzado"],
-        })
     report = {
-        "sitios": [{"name": s["name"], "start": s["start"], "hosts": sorted(s["hosts"]), "max_total_mb": s.get("max_total_mb", 2048), "use_proxy": s.get("use_proxy", False)} for s in SITES],
-        "almacenamiento_por_sitio": storage_report,
+        "sitios": [{"name": s["name"], "start": s["start"]} for s in SITES],
         "paginas_por_sitio": visited_by_site,
-        "paginas_en_mapa": len(page_urls),
-        "recursos_capturados": len(asset_urls),
         "archivos_generados": len(files),
-        "tamano_total_bytes": total_bytes,
         "tamano_total_MB": round(total_bytes / 1024 / 1024, 2),
-        "limite_por_recurso_MB": format_mb(MAX_RESOURCE_SIZE),
-        "network_idle_timeout_ms": NETWORK_IDLE_TIMEOUT,
-        "trabajadores_simultaneos": PAGE_WORKERS,
-        "reintentos_navegacion": NAVIGATION_RETRIES,
-        "espera_adicional_ms": WAIT_AFTER_LOAD_MS,
         "errores": len(errors),
-        "nota": "Los límites por sitio contabilizan los archivos guardados durante esta ejecución. El tamaño total de la carpeta salida también puede incluir archivos de ejecuciones anteriores. Los contenidos dependientes de APIs, autenticación, streaming o servidores externos pueden no funcionar completamente sin conexión."
     }
     Path("informe-descarga.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     Path("errores-descarga.txt").write_text("\n".join(errors), encoding="utf-8")
-    print("\n========== INFORME FINAL ==========")
+    print("\n========== INFORME ==========")
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
 async def main():
     ROOT.mkdir(parents=True, exist_ok=True)
     METADATA.mkdir(parents=True, exist_ok=True)
+
     print("=" * 65)
-    print("DESCARGADOR DE DOCUMENTACIÓN OFFLINE (Patchright)")
-    print("SITIOS CONFIGURADOS:", len(SITES))
-    print("MÁXIMO DE PÁGINAS POR SITIO:", MAX_PAGES_PER_SITE)
-    print("PROFUNDIDAD MÁXIMA:", MAX_DEPTH)
-    print("MÁXIMO POR ARCHIVO:", format_mb(MAX_RESOURCE_SIZE), "MB")
-    print("TRABAJADORES SIMULTÁNEOS:", PAGE_WORKERS)
+    print("DESCARGADOR HÍBRIDO — proxy + directo, con watchdog")
     print("=" * 65)
 
     load_previous_maps()
-    infer_old_pages()
     normalize_existing_paths()
 
     async with async_playwright() as playwright:
@@ -1149,43 +1257,50 @@ async def main():
             browser = await playwright.chromium.launch(
                 headless=True,
                 channel="chrome",
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                ]
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
             )
-            print("[Patchright] Navegador lanzado con canal 'chrome'.")
-        except Exception as exc:
-            print(f"[Patchright] 'chrome' no disponible ({exc}). Usando Chromium parcheado de Patchright.")
+            print("[Patchright] Chrome.")
+        except Exception:
             browser = await playwright.chromium.launch(
                 headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                ]
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
             )
+            print("[Patchright] Chromium parcheado.")
+
+        base_kwargs = dict(
+            ignore_https_errors=True,
+            viewport={"width": 1920, "height": 1080},
+            locale="es-ES",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            extra_http_headers={
+                "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+        )
+
+        CONTEXTS["proxy"] = await browser.new_context(proxy=PROXY_CONFIG, **base_kwargs)
+        print("[Contexto] proxy:", PROXY_CONFIG["server"])
+        CONTEXTS["direct"] = await browser.new_context(**base_kwargs)
+        print("[Contexto] directo")
 
         try:
             for site in SITES:
-                await crawl_site(browser, site)
+                await crawl_site(browser, site, base_kwargs)
         finally:
             await browser.close()
 
-    print("\n===== GUARDANDO MAPAS =====")
-    save_maps()
-    print("\n===== REESCRIBIENDO HTML =====")
+    print("\n===== GUARDANDO MAPAS FINALES =====")
+    save_maps_now()
+    print("\n===== REESCRITURA HTML =====")
     rewrite_html()
-    print("\n===== REESCRIBIENDO CSS =====")
+    print("\n===== REESCRITURA CSS =====")
     rewrite_css()
-    print("\n===== CREANDO ÍNDICE OFFLINE =====")
+    print("\n===== ÍNDICE OFFLINE =====")
     create_offline_index()
     audit_artifact_paths()
-    save_maps()
-    print("\n===== GENERANDO INFORME =====")
+    save_maps_now()
     create_report()
-    print("\n===== PROCESO TERMINADO =====")
+    print("\n===== FIN =====")
 
 
 if __name__ == "__main__":
