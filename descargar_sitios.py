@@ -1,3 +1,16 @@
+# -*- coding: utf-8 -*-
+"""
+PONN.IO OFFLINE DOWNLOADER
+- Interfaz en español.
+- Conserva el material de aprendizaje de inglés y sus traducciones al español.
+- Los audiolibros se descargan únicamente si el índice declara lang=en.
+- Los chunks del lector guardan ambos idiomas (en/es) porque el español es la traducción.
+- Captura respuestas JSON de fetch/XHR del propio sitio y del endpoint de chunks.
+- Descarga audios del lector y sus timings desde reader-audio/audio.json.
+- Filtra reader.html por sourceLang de reader-index.json y por sufijos de idioma en IDs.
+- Rota TrueProxies -> ScrapeOps -> Oxylabs ante errores de proxy/cuota.
+- No modifica ni automatiza cuentas, ni intenta saltarse restricciones de acceso.
+"""
 import os
 import asyncio
 import re
@@ -12,13 +25,35 @@ from bs4 import BeautifulSoup
 from patchright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ============================================================
-# PROXY (ScrapeOps - Residencial)
+# PROXIES RESIDENCIALES EN ORDEN DE USO
+# 1) TrueProxies  2) ScrapeOps  3) Oxylabs
+# Las credenciales fueron proporcionadas por el usuario.
+# TrueProxies se rota preventivamente a los 48 min porque el acceso
+# gratuito indicado por el usuario dura aproximadamente 50 min.
 # ============================================================
-PROXY_CONFIG = {
-    "server": "http://residential-proxy.scrapeops.io:8181",
-    "username": "scrapeops",
-    "password": "7d7df815-de06-4ba8-9693-ab8cacefe03a",
+PROXY_CONFIGS = {
+    "trueproxies": {
+        "server": "http://resi-ipv4-6.gw.tprx.io:8080",
+        "username": "63lz3an8ulxa-rotate",
+        "password": "k73TU0KeofRVd5feE3mi",
+    },
+    "scrapeops": {
+        "server": "http://residential-proxy.scrapeops.io:8181",
+        "username": "scrapeops",
+        "password": "73ec1186-54e5-4821-8ef3-50ee272dff96",
+    },
+    "oxylabs": {
+        "server": "http://pr.oxylabs.io:7777",
+        "username": "customer-resi_b62ad9f3",
+        "password": "86f1P~3acINB",
+    },
 }
+PROXY_ORDER = ("trueproxies", "scrapeops", "oxylabs")
+TRUEPROXIES_MAX_SECONDS = 59 * 60
+PROXY_DISABLED = set()
+PROXY_STARTED_AT = {}
+ACTIVE_PROXY_NAME = "trueproxies"
+PAGE_PROXY_NAMES = {}
 
 CATALOG_SEEDS = [
     "https://ponn.io/books/mapping.json",
@@ -35,6 +70,7 @@ CATALOG_SEEDS = [
     "https://ponn.io/audiobooks/data/desc-ids/es.json",
     "https://ponn.io/audiobooks/data/desc/es.json",
     "https://ponn.io/sandbox/reader-audio/audio.json",
+    "https://ponn.io/mw/lg-manifest-1264ceac.json",
     "https://ponn.io/mw/lesson-tasks.css?v=2",
     "https://ponn.io/mw/lesson-games.css?v=1104p",
     "https://ponn.io/mw/lesson-games-es-f6f9e708.js?v=1104p",
@@ -47,16 +83,19 @@ SITES = [
         "start": "https://ponn.io/es/",
         "starts": ["https://ponn.io/es/"],
         "hosts": {"ponn.io"},
-        "resource_hosts": set(),
+        "resource_hosts": {"getbookchunk-ab3uqz2diq-ew.a.run.app"},
         "allowed_paths": ["/es/", "/reader.html", "/audiobooks/", "/games/", "/sandbox/"],
         "exclude_paths": [
+            # Se conserva toda la navegación española y sus páginas de inglés.
+            # Solo se excluyen secciones cuyo idioma de aprendizaje no es inglés.
             "/en/",
             "/es/serbio/", "/es/aleman/", "/es/frances/", "/es/italiano/",
-            "/es/portugues/", "/es/ruso/", "/es/japones/", "/es/chino/",
-            "/es/coreano/", "/es/arabe/", "/es/turco/", "/es/polaco/",
-            "/es/holandes/", "/es/sueco/", "/es/noruego/", "/es/danes/",
-            "/es/finlandes/", "/es/griego/", "/es/hebreo/", "/es/hindi/",
-            "/es/ingles/video/", "/es/ingles/cursos/",
+            "/es/portugues/", "/es/portugues-brasileno/", "/es/ruso/",
+            "/es/japones/", "/es/chino/", "/es/coreano/", "/es/arabe/",
+            "/es/turco/", "/es/polaco/", "/es/holandes/", "/es/sueco/",
+            "/es/noruego/", "/es/danes/", "/es/finlandes/", "/es/griego/",
+            "/es/hebreo/", "/es/hindi/", "/es/checo/", "/es/rumano/",
+            "/es/georgiano/", "/es/hungaro/", "/es/ucraniano/",
         ],
         "expand_load_more": True,
         "max_load_more_clicks": 100,
@@ -65,7 +104,10 @@ SITES = [
     },
 ]
 
-CONTEXTS = {"proxy": None, "direct": None}
+CONTEXTS = {
+    "proxy": None, "direct": None,
+    "trueproxies": None, "scrapeops": None, "oxylabs": None,
+}
 CURRENT_TRACKER = {"ref": None}
 
 ROOT = Path("salida")
@@ -163,8 +205,14 @@ def create_site_tracker(site):
         "archivos": {},
         "limite_alcanzado": False,
         "bytes_proxy": 0,
+        "bytes_trueproxies": 0,
+        "bytes_scrapeops": 0,
+        "bytes_oxylabs": 0,
         "bytes_direct": 0,
         "requests_proxy": 0,
+        "requests_trueproxies": 0,
+        "requests_scrapeops": 0,
+        "requests_oxylabs": 0,
         "requests_direct": 0,
     }
 
@@ -177,7 +225,12 @@ def register_transfer(bytes_count, via):
     tracker = CURRENT_TRACKER["ref"]
     if not tracker:
         return
-    if via == "proxy":
+    if via in PROXY_ORDER:
+        tracker["bytes_" + via] += bytes_count
+        tracker["requests_" + via] += 1
+        tracker["bytes_proxy"] += bytes_count
+        tracker["requests_proxy"] += 1
+    elif via == "proxy":
         tracker["bytes_proxy"] += bytes_count
         tracker["requests_proxy"] += 1
     elif via == "direct":
@@ -252,6 +305,97 @@ def is_internal(url, site):
         return False
 
 
+
+AUDIOBOOK_INDEX_URL = "https://ponn.io/audiobooks/data/index.json"
+AUDIOBOOK_IDS_EN = set()
+AUDIOBOOK_INDEX_LOADED = False
+
+READER_AUDIO_INDEX_URL = "https://ponn.io/sandbox/reader-audio/audio.json"
+READER_AUDIO_INDEX = {}
+READER_AUDIO_INDEX_LOADED = False
+
+# Idiomas observados en reader-index.json, covers-lang.json,
+# chapter-summary/index.json y levels.json del material enviado.
+# También se incluyen códigos que aparecen en las rutas de PONN.
+ENGLISH_LANGUAGE_CODES = {"en", "eng", "english"}
+KNOWN_LANGUAGE_CODES = {
+    "al", "am", "ar", "az", "br", "cn", "cs", "da", "de", "en", "es",
+    "el", "fi", "fr", "ge", "gr", "he", "hi", "hu", "id", "it", "ja", "jp",
+    "ka", "ko", "kz", "lt", "lv", "nl", "no", "pl", "pt", "pt-br",
+    "ro", "rs", "ru", "sr", "sv", "tr", "ua", "vi", "zh"
+}
+NON_ENGLISH_SUFFIXES = KNOWN_LANGUAGE_CODES - ENGLISH_LANGUAGE_CODES
+READER_SOURCE_LANG_BY_ID = {}
+READER_SOURCE_INDEX_LOADED = False
+READER_SOURCE_INDEX_URL = "https://ponn.io/books/reader-index.json"
+LEVEL_SUFFIXES = {"a1", "a2", "b1", "b2", "c1", "c2"}
+
+
+def reader_id_looks_non_english(book_id):
+    """True si el catálogo declara idioma original no inglés o el ID lo marca.
+
+    reader-index.json es la fuente prioritaria: su sourceLang describe el
+    idioma del texto original, mientras que lang=es de reader.html describe
+    la traducción/interfaz y no debe confundirse con el idioma del libro.
+    Para IDs de niveles que no aparecen en reader-index se usa el sufijo
+    explícito, por ejemplo _de_a2, _it_b1, _pl o _summary_de.
+    """
+    value = str(book_id or "").strip().lower()
+    if not value:
+        return False
+
+    source_lang = READER_SOURCE_LANG_BY_ID.get(value)
+    if source_lang:
+        normalized = str(source_lang).strip().lower().replace("_", "-")
+        if normalized not in ENGLISH_LANGUAGE_CODES:
+            return True
+        return False
+
+    # Variantes simplificadas: book_id_de_a2 / book_id_en_b1.
+    match = re.search(r"_([a-z]{2,3}(?:-[a-z]{2,4})?)_(a1|a2|b1|b2|c1|c2)$", value)
+    if match:
+        code = match.group(1)
+        return code in KNOWN_LANGUAGE_CODES and code not in ENGLISH_LANGUAGE_CODES
+
+    # IDs con sufijo de idioma: ..._summary_de / ..._by_author_it.
+    match = re.search(r"_([a-z]{2,3}(?:-[a-z]{2,4})?)$", value)
+    if match:
+        code = match.group(1)
+        return code in KNOWN_LANGUAGE_CODES and code not in ENGLISH_LANGUAGE_CODES
+
+    return False
+
+def collect_english_audiobook_ids(obj):
+    """Los IDs son las claves del índice; cada registro declara su lang."""
+    if not isinstance(obj, dict):
+        return set()
+    return {
+        str(book_id)
+        for book_id, record in obj.items()
+        if isinstance(record, dict)
+        and str(record.get("lang", "")).strip().lower() in {"en", "eng", "english"}
+    }
+
+
+def extract_reader_records(obj):
+    """Recoge book IDs y lengua cuando el catálogo la declara explícitamente."""
+    records = {}
+    def walk(node):
+        if isinstance(node, dict):
+            lang = node.get("lang") or node.get("language") or node.get("sourceLang")
+            bid = node.get("bookId") or node.get("book_id") or node.get("id")
+            if isinstance(bid, str) and isinstance(lang, str):
+                records[bid] = lang.strip().lower()
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    walk(value)
+    walk(obj)
+    return records
+
 def is_allowed_page(url, site):
     if not is_internal(url, site):
         return False
@@ -264,8 +408,11 @@ def is_allowed_page(url, site):
                 return False
         if path == "/reader.html":
             qs = parse_qs(parts.query)
-            lang = qs.get("lang", [None])[0]
-            if lang != "es":
+            ui_lang = qs.get("lang", [None])[0]
+            book_id = qs.get("id", [""])[0]
+            if ui_lang != "es" or not book_id:
+                return False
+            if reader_id_looks_non_english(book_id):
                 return False
         allowed_paths = site.get("allowed_paths")
         if not allowed_paths:
@@ -521,6 +668,91 @@ def load_previous_maps():
 
 
 # ============================================================
+# ROTACIÓN DE PROXIES
+# ============================================================
+def get_proxy_order():
+    """Devuelve proxies activos; TrueProxies se desactiva antes de los 50 min."""
+    global ACTIVE_PROXY_NAME
+    now = time.monotonic()
+    started = PROXY_STARTED_AT.get("trueproxies")
+    if (started is not None and "trueproxies" not in PROXY_DISABLED
+            and now - started >= TRUEPROXIES_MAX_SECONDS):
+        PROXY_DISABLED.add("trueproxies")
+        print("[Proxy] TrueProxies: rotación preventiva (48 min).")
+
+    available = [name for name in PROXY_ORDER if name not in PROXY_DISABLED and CONTEXTS.get(name)]
+    if available:
+        if ACTIVE_PROXY_NAME not in available:
+            ACTIVE_PROXY_NAME = available[0]
+        CONTEXTS["proxy"] = CONTEXTS[ACTIVE_PROXY_NAME]
+    return available
+
+
+def mark_proxy_unavailable(name, reason):
+    """Desactiva un proveedor durante esta ejecución tras un error de proxy/cuota."""
+    global ACTIVE_PROXY_NAME
+    if name not in PROXY_ORDER or name in PROXY_DISABLED:
+        return
+    PROXY_DISABLED.add(name)
+    remaining = [item for item in PROXY_ORDER if item not in PROXY_DISABLED and CONTEXTS.get(item)]
+    if remaining:
+        ACTIVE_PROXY_NAME = remaining[0]
+        CONTEXTS["proxy"] = CONTEXTS[ACTIVE_PROXY_NAME]
+        print(f"[Proxy] {name} no disponible ({reason}). Siguiente: {ACTIVE_PROXY_NAME}.")
+    else:
+        CONTEXTS["proxy"] = None
+        print(f"[Proxy] {name} no disponible ({reason}). Sin proxies restantes.")
+
+
+def proxy_error_indicated(status, body="", exception_text=""):
+    """Distingue errores de proxy/cuota de errores normales del sitio de destino."""
+    text = (str(body) + " " + str(exception_text)).lower()
+    if status in (402, 407):
+        return True
+    indicators = (
+        "proxy authentication", "proxy auth", "insufficient balance",
+        "out of balance", "no balance", "quota exceeded", "quota limit",
+        "bandwidth limit", "traffic limit", "traffic exceeded",
+        "subscription expired", "account disabled", "customer disabled",
+        "no credit", "credits exhausted", "limit reached", "limit exceeded",
+        "daily limit", "usage limit", "traffic exhausted", "proxy error",
+    )
+    return any(token in text for token in indicators)
+
+
+def is_proxy_connection_exception(exc):
+    text = str(exc).lower()
+    indicators = (
+        "proxy", "tunnel", "econnreset", "connection refused",
+        "connection reset", "name_not_resolved", "err_tunnel",
+        "net::err_proxy", "407", "authentication", "timeout", "timed out",
+    )
+    return any(token in text for token in indicators)
+
+
+async def ensure_page_uses_active_proxy(page, attach_resource_listener):
+    """Recrea la página en el contexto del proveedor activo cuando hubo rotación."""
+    available = get_proxy_order()
+    proxy_name = available[0] if available else "direct"
+    if not CONTEXTS.get(proxy_name):
+        return page
+    current_name = PAGE_PROXY_NAMES.get(id(page))
+    if current_name == proxy_name:
+        return page
+    try:
+        await page.close()
+    except Exception:
+        pass
+    context = CONTEXTS[proxy_name]
+    new_page = await context.new_page()
+    context.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
+    context.set_default_timeout(15000)
+    PAGE_PROXY_NAMES[id(new_page)] = proxy_name
+    attach_resource_listener(new_page, proxy_name)
+    return new_page
+
+
+# ============================================================
 # FETCH HÍBRIDO CON CACHE Y CONTADORES
 # ============================================================
 async def fetch_bytes(url, prefer_direct=True):
@@ -531,22 +763,45 @@ async def fetch_bytes(url, prefer_direct=True):
         except Exception:
             pass
 
-    order = ["direct", "proxy"] if prefer_direct else ["proxy", "direct"]
+    proxy_order = get_proxy_order()
+    order = (["direct"] + proxy_order) if prefer_direct else (proxy_order + ["direct"])
+
     for ctx_name in order:
         ctx = CONTEXTS.get(ctx_name)
         if not ctx:
             continue
+        if ctx_name in PROXY_ORDER:
+            PROXY_STARTED_AT.setdefault(ctx_name, time.monotonic())
         try:
             response = await ctx.request.get(url, timeout=60000)
             if response.ok:
                 body = await response.body()
                 if body:
-                    if ctx_name in ("proxy", "direct"):
-                        register_transfer(len(body), ctx_name)
+                    register_transfer(len(body), ctx_name)
                     return body, ctx_name
-        except Exception:
+                continue
+
+            try:
+                response_text = await response.text()
+            except Exception:
+                response_text = ""
+
+            if ctx_name in PROXY_ORDER and proxy_error_indicated(response.status, response_text):
+                mark_proxy_unavailable(ctx_name, f"HTTP {response.status}/cuota")
+                continue
+
+            # 403/404/429 u otros errores del destino no se interpretan como
+            # agotamiento del proxy: no desactivamos el proveedor por ello.
+            if response.status in (403, 404, 410, 429):
+                if ctx_name == "direct":
+                    continue
+                return None, None
+        except Exception as exc:
+            if ctx_name in PROXY_ORDER and is_proxy_connection_exception(exc):
+                mark_proxy_unavailable(ctx_name, "error de conexión de proxy")
             continue
     return None, None
+
 
 
 def save_fetched(data, url, tracker, content_type=None, description=None):
@@ -586,6 +841,65 @@ def chunk_has_data(data_bytes, type_):
 # ============================================================
 # AUDIOLIBROS
 # ============================================================
+
+async def load_english_audiobook_index(tracker):
+    global AUDIOBOOK_INDEX_LOADED, AUDIOBOOK_IDS_EN
+    if AUDIOBOOK_INDEX_LOADED:
+        return AUDIOBOOK_IDS_EN
+    data, via = await fetch_bytes(AUDIOBOOK_INDEX_URL, prefer_direct=False)
+    if not data:
+        errors.append("ÍNDICE AUDIOBOOK | no se pudo descargar")
+        AUDIOBOOK_INDEX_LOADED = True
+        return set()
+    save_fetched(data, AUDIOBOOK_INDEX_URL, tracker, content_type="application/json")
+    try:
+        parsed = json.loads(data)
+        AUDIOBOOK_IDS_EN = collect_english_audiobook_ids(parsed)
+        print(f"   [Audio] Índice: {len(AUDIOBOOK_IDS_EN)} registros en inglés ({via})")
+    except Exception as exc:
+        errors.append(f"ÍNDICE AUDIOBOOK PARSE | {exc}")
+    AUDIOBOOK_INDEX_LOADED = True
+    return AUDIOBOOK_IDS_EN
+
+async def load_reader_source_language_index(tracker):
+    """Carga reader-index.json y crea un mapa ID -> idioma original."""
+    global READER_SOURCE_INDEX_LOADED, READER_SOURCE_LANG_BY_ID
+    if READER_SOURCE_INDEX_LOADED:
+        return READER_SOURCE_LANG_BY_ID
+
+    data, via = await fetch_bytes(READER_SOURCE_INDEX_URL, prefer_direct=False)
+    if not data:
+        errors.append("READER INDEX | no se pudo descargar; se aplicará el filtro por sufijos")
+        READER_SOURCE_INDEX_LOADED = True
+        return READER_SOURCE_LANG_BY_ID
+
+    save_fetched(data, READER_SOURCE_INDEX_URL, tracker, content_type="application/json")
+    try:
+        parsed = json.loads(data)
+        if not isinstance(parsed, list):
+            raise ValueError("reader-index.json no contiene una lista")
+
+        source_map = {}
+        for record in parsed:
+            if not isinstance(record, dict):
+                continue
+            book_id = record.get("id")
+            source_lang = record.get("sourceLang")
+            if isinstance(book_id, str) and isinstance(source_lang, str) and source_lang.strip():
+                source_map[book_id.strip().lower()] = source_lang.strip().lower()
+
+        READER_SOURCE_LANG_BY_ID = source_map
+        non_english = sum(1 for lang in source_map.values() if lang not in ENGLISH_LANGUAGE_CODES)
+        english = sum(1 for lang in source_map.values() if lang in ENGLISH_LANGUAGE_CODES)
+        print(f"   [Reader Index] {len(source_map)} idiomas originales declarados ({via}) | inglés={english} | otros={non_english}")
+    except Exception as exc:
+        errors.append(f"READER INDEX PARSE | {exc}")
+        READER_SOURCE_LANG_BY_ID = {}
+
+    READER_SOURCE_INDEX_LOADED = True
+    return READER_SOURCE_LANG_BY_ID
+
+
 async def process_audiobook(site, tracker, book_id):
     json_url = f"https://ponn.io/audiobooks/data/books/{book_id}.json"
     data, ctx_used = await fetch_bytes(json_url, prefer_direct=False)
@@ -609,11 +923,13 @@ async def process_audiobook(site, tracker, book_id):
         return 0
 
     count = 0
+    total_seconds = sum(int(ch.get("seconds", 0) or 0) for ch in chapters)
+    print(f"      [Audio] {book_id}: {len(chapters)} capítulos | {total_seconds // 3600}h{(total_seconds % 3600) // 60:02d}m")
     for ch in chapters:
         file = ch.get("file")
         if not file:
             continue
-        mp3_url = base_url + file
+        mp3_url = urljoin(base_url.rstrip("/") + "/", file)
         mp3_data, _ = await fetch_bytes(mp3_url, prefer_direct=True)
         if mp3_data:
             p = save_fetched(mp3_data, mp3_url, tracker, content_type="audio/mpeg")
@@ -629,6 +945,90 @@ async def process_audiobook(site, tracker, book_id):
 
     print(f"      [Audio] {book_id}: {count}/{len(chapters)} MP3")
     return count
+
+
+async def load_reader_audio_index(tracker):
+    """Carga el índice de audio sincronizado del lector."""
+    global READER_AUDIO_INDEX_LOADED, READER_AUDIO_INDEX
+    if READER_AUDIO_INDEX_LOADED:
+        return READER_AUDIO_INDEX
+
+    data, via = await fetch_bytes(READER_AUDIO_INDEX_URL, prefer_direct=False)
+    if not data:
+        errors.append("ÍNDICE READER AUDIO | no se pudo descargar")
+        READER_AUDIO_INDEX_LOADED = True
+        return {}
+
+    save_fetched(data, READER_AUDIO_INDEX_URL, tracker, content_type="application/json")
+    try:
+        parsed = json.loads(data)
+        if not isinstance(parsed, dict):
+            raise ValueError("el índice no contiene un objeto JSON")
+        READER_AUDIO_INDEX = parsed
+        print(f"   [Reader Audio] Índice: {len(parsed)} libros ({via})")
+    except Exception as exc:
+        errors.append(f"ÍNDICE READER AUDIO PARSE | {exc}")
+        READER_AUDIO_INDEX = {}
+    READER_AUDIO_INDEX_LOADED = True
+    return READER_AUDIO_INDEX
+
+
+async def process_reader_audio(tracker, book_id):
+    """Descarga MP3 y JSON de sincronización declarados por audio.json."""
+    if not book_id or reader_id_looks_non_english(book_id):
+        return 0, 0
+
+    audio_index = await load_reader_audio_index(tracker)
+    book = audio_index.get(book_id)
+    if not isinstance(book, dict):
+        return 0, 0
+
+    parts = book.get("parts", [])
+    if not isinstance(parts, list) or not parts:
+        errors.append(f"READER AUDIO SIN PARTES | {book_id}")
+        return 0, 0
+
+    mp3_ok = 0
+    timings_ok = 0
+    print(f"      [Reader Audio] {book_id}: {len(parts)} partes | voz: {book.get('voice', 'n/d')}")
+
+    for part_number, part in enumerate(parts, 1):
+        if not isinstance(part, dict):
+            continue
+
+        audio_ref = part.get("audio")
+        timings_ref = part.get("timings")
+
+        if isinstance(audio_ref, str) and audio_ref.strip():
+            audio_url = urljoin(READER_AUDIO_INDEX_URL, audio_ref.strip())
+            audio_data, audio_via = await fetch_bytes(audio_url, prefer_direct=True)
+            if audio_data:
+                saved = save_fetched(audio_data, audio_url, tracker, content_type="audio/mpeg")
+                if saved:
+                    mp3_ok += 1
+                    print(f"         [MP3] Parte {part_number}/{len(parts)} ({audio_via})")
+            else:
+                errors.append(f"READER AUDIO MP3 FALLO | {book_id} | parte={part_number} | {audio_url}")
+
+        if isinstance(timings_ref, str) and timings_ref.strip():
+            timings_url = urljoin(READER_AUDIO_INDEX_URL, timings_ref.strip())
+            timings_data, timings_via = await fetch_bytes(timings_url, prefer_direct=False)
+            if timings_data:
+                try:
+                    parsed_timings = json.loads(timings_data)
+                    if not isinstance(parsed_timings, list):
+                        raise ValueError("el JSON de tiempos no es una lista")
+                except Exception as exc:
+                    errors.append(f"READER AUDIO TIMINGS INVÁLIDO | {book_id} | parte={part_number} | {exc}")
+                    continue
+                saved = save_fetched(timings_data, timings_url, tracker, content_type="application/json")
+                if saved:
+                    timings_ok += 1
+            else:
+                errors.append(f"READER AUDIO TIMINGS FALLO | {book_id} | parte={part_number} | {timings_url}")
+
+    print(f"      [Reader Audio] {book_id}: MP3 {mp3_ok}/{len(parts)} | timings {timings_ok}/{len(parts)}")
+    return mp3_ok, timings_ok
 
 
 # ============================================================
@@ -650,6 +1050,12 @@ async def fetch_and_save_chunk(url, book_id, lang, type_, from_, semaphore, trac
 async def process_reader(site, tracker, book_id):
     if not book_id:
         return 0
+    if reader_id_looks_non_english(book_id):
+        print(f"      [Reader] Omitido por idioma original no inglés: {book_id}")
+        return 0
+
+    # Descargar el audio del índice incluso si el TOC de texto no responde.
+    audio_mp3_ok, audio_timings_ok = await process_reader_audio(tracker, book_id)
 
     toc_url = f"https://getbookchunk-ab3uqz2diq-ew.a.run.app/?bookId={book_id}&lang=es&type=toc&from=1&access=free"
     toc_data, _ = await fetch_bytes(toc_url, prefer_direct=True)
@@ -688,26 +1094,15 @@ async def process_reader(site, tracker, book_id):
     results = await asyncio.gather(*tasks, return_exceptions=True)
     total_chunks = sum(1 for r in results if isinstance(r, int) and r > 0)
 
-    # reader-audio partN (secuencial, son pocos)
-    n = 1
-    parts_ok = 0
-    while n <= 100:
-        url = f"https://ponn.io/sandbox/reader-audio/acc/{book_id}/part{n}.json"
-        data, _ = await fetch_bytes(url, prefer_direct=True)
-        if not data or len(data) < 10:
-            break
-        if save_fetched(data, url, tracker, content_type="application/json"):
-            parts_ok += 1
-        n += 1
-
-    print(f"      [Reader] {book_id}: {total_chunks} chunks + {parts_ok} parts")
+    print(f"      [Reader] {book_id}: {total_chunks} chunks + "
+          f"{audio_mp3_ok} MP3 + {audio_timings_ok} timings")
     return total_chunks
 
 
 # ============================================================
 # LISTENER DE RECURSOS
 # ============================================================
-async def save_response_resource(response, site, tracker):
+async def save_response_resource(response, site, tracker, via="proxy"):
     url = ""
     try:
         if tracker["limite_alcanzado"]: return
@@ -716,7 +1111,7 @@ async def save_response_resource(response, site, tracker):
         if response.status not in (200, 206): return
         url = clean_url(response.url)
         if not url or not is_allowed_resource(url, site): return
-        allowed = {"stylesheet", "script", "image", "font", "manifest", "media"}
+        allowed = {"stylesheet", "script", "image", "font", "manifest", "media", "xhr", "fetch"}
         if resource_type not in allowed: return
         lock = resource_locks.setdefault(url, asyncio.Lock())
         async with lock:
@@ -724,6 +1119,15 @@ async def save_response_resource(response, site, tracker):
             if existing_file and Path(existing_file).is_file(): return
             headers = response.headers
             content_type = headers.get("content-type", "")
+            mime = content_type.split(";", 1)[0].strip().lower()
+            if resource_type in {"xhr", "fetch"}:
+                # Solo respuestas estructuradas útiles; ignora telemetría, píxeles y texto arbitrario.
+                if not (mime in {"application/json", "text/json", "application/ld+json", "text/plain"}):
+                    return
+                if "getbookchunk-ab3uqz2diq-ew.a.run.app" not in url and urlsplit(url).hostname not in site["hosts"]:
+                    return
+                if any(token in url.lower() for token in ("/cdn-cgi/rum", "google-analytics", "collect?", "telemetry")):
+                    return
             length = headers.get("content-length")
             if length:
                 try:
@@ -740,7 +1144,7 @@ async def save_response_resource(response, site, tracker):
                     if body_attempt >= RESOURCE_BODY_RETRIES: raise
                     await asyncio.sleep(0.25 * body_attempt)
             if not data or len(data) > MAX_RESOURCE_SIZE or looks_like_html(data): return
-            register_transfer(len(data), "proxy")
+            register_transfer(len(data), via)
             save_fetched(data, url, tracker, content_type=content_type)
     except Exception as exc:
         errors.append(f"RECURSO | {url or response.url} | {exc}")
@@ -825,21 +1229,23 @@ async def expand_load_more(page, site):
 # ============================================================
 async def recreate_contexts(browser, base_kwargs):
     print("   [Watchdog] Recreando contextos (limpieza de conexiones)...")
-    try:
-        if CONTEXTS["proxy"]:
-            await CONTEXTS["proxy"].close()
-    except Exception:
-        pass
-    try:
-        if CONTEXTS["direct"]:
-            await CONTEXTS["direct"].close()
-    except Exception:
-        pass
-    CONTEXTS["proxy"] = await browser.new_context(proxy=PROXY_CONFIG, **base_kwargs)
-    CONTEXTS["proxy"].set_default_navigation_timeout(NAVIGATION_TIMEOUT)
-    CONTEXTS["proxy"].set_default_timeout(15000)
-    CONTEXTS["direct"] = await browser.new_context(**base_kwargs)
-    print("   [Watchdog] Contextos recreados.")
+    for name in list(PROXY_ORDER) + ["direct"]:
+        try:
+            if CONTEXTS.get(name):
+                await CONTEXTS[name].close()
+        except Exception:
+            pass
+        if name in PROXY_ORDER:
+            if name not in PROXY_DISABLED:
+                CONTEXTS[name] = await browser.new_context(proxy=PROXY_CONFIGS[name], **base_kwargs)
+                CONTEXTS[name].set_default_navigation_timeout(NAVIGATION_TIMEOUT)
+                CONTEXTS[name].set_default_timeout(15000)
+        else:
+            CONTEXTS[name] = await browser.new_context(**base_kwargs)
+    active = get_proxy_order()
+    CONTEXTS["proxy"] = CONTEXTS[active[0]] if active else None
+    print("   [Watchdog] Contextos recreados. Proxy activo:", active[0] if active else "ninguno")
+
 
 
 def runtime_exceeded():
@@ -862,12 +1268,13 @@ async def crawl_site(browser, site, base_kwargs):
     for seed_url in CATALOG_SEEDS:
         data, ctx_used = await fetch_bytes(seed_url, prefer_direct=False)
         if data:
-            save_fetched(data, seed_url, tracker)
+            save_fetched(data, seed_url, tracker, content_type="application/json" if seed_url.lower().split("?")[0].endswith(".json") else None)
             print(f"   [Catálogo] {seed_url.split('/')[-1]} ({ctx_used})")
 
-    ctx_proxy = CONTEXTS["proxy"]
-    ctx_proxy.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
-    ctx_proxy.set_default_timeout(15000)
+    # reader-index.json contiene sourceLang: idioma del texto original.
+    # Debe cargarse antes de filtrar enlaces /reader.html?id=...&lang=es.
+    await load_reader_source_language_index(tracker)
+    await load_english_audiobook_index(tracker)
 
     starts = site.get("starts", [site["start"]])
     initial_urls = list(dict.fromkeys(clean_url(url) for url in starts if clean_url(url)))
@@ -886,17 +1293,28 @@ async def crawl_site(browser, site, base_kwargs):
     consecutive_fails = {"count": 0}
     pages_since_ctx_recreate = {"count": 0}
 
+    available_proxies = get_proxy_order()
+    initial_proxy = available_proxies[0] if available_proxies else "direct"
+    if initial_proxy in PROXY_ORDER:
+        PROXY_STARTED_AT.setdefault(initial_proxy, time.monotonic())
+    else:
+        print("[Proxy] Sin proxies residenciales restantes; navegación directa de respaldo.")
+    ctx_proxy = CONTEXTS[initial_proxy]
+    ctx_proxy.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
+    ctx_proxy.set_default_timeout(15000)
+
     pages = [await ctx_proxy.new_page() for _ in range(PAGE_WORKERS)]
 
-    def attach_resource_listener(page):
+    def attach_resource_listener(page, proxy_name):
+        PAGE_PROXY_NAMES[id(page)] = proxy_name
         def on_response(response):
-            task = asyncio.create_task(save_response_resource(response, site, tracker))
+            task = asyncio.create_task(save_response_resource(response, site, tracker, via=proxy_name))
             resource_tasks.add(task)
             task.add_done_callback(resource_tasks.discard)
         page.on("response", on_response)
 
     for page in pages:
-        attach_resource_listener(page)
+        attach_resource_listener(page, initial_proxy)
 
     async def worker(worker_id, page):
         nonlocal pages_saved, retry_count
@@ -919,6 +1337,7 @@ async def crawl_site(browser, site, base_kwargs):
                 current_url, depth, attempt = item
                 current_url = clean_url_with_hash(current_url)
                 key = dedup_key(current_url)
+                page = await ensure_page_uses_active_proxy(page, attach_resource_listener)
 
                 if not current_url or key in in_progress:
                     continue
@@ -970,6 +1389,8 @@ async def crawl_site(browser, site, base_kwargs):
                 base_url = current_url.split("#", 1)[0] if has_hash else current_url
 
                 for nav_attempt in range(1, NAVIGATION_RETRIES + 1):
+                    page = await ensure_page_uses_active_proxy(page, attach_resource_listener)
+                    page_proxy = PAGE_PROXY_NAMES.get(id(page), ACTIVE_PROXY_NAME)
                     try:
                         response = await page.goto(current_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
                     except PlaywrightTimeoutError:
@@ -977,8 +1398,22 @@ async def crawl_site(browser, site, base_kwargs):
                             await page.wait_for_timeout(RETRY_DELAY_MS)
                             continue
                         navigation_timed_out = True
+                        mark_proxy_unavailable(page_proxy, "timeout persistente de navegación")
+                        page = await ensure_page_uses_active_proxy(page, attach_resource_listener)
                         response = None
                         break
+                    if response is not None and response.status >= 400:
+                        try:
+                            response_body = await response.text()
+                        except Exception:
+                            response_body = ""
+                        if proxy_error_indicated(response.status, response_body):
+                            mark_proxy_unavailable(page_proxy, f"HTTP {response.status}/cuota en navegación")
+                            page = await ensure_page_uses_active_proxy(page, attach_resource_listener)
+                            if nav_attempt < NAVIGATION_RETRIES:
+                                continue
+                            response = None
+                            break
                     if (response is not None and response.status in (429, 500, 502, 503, 504) and nav_attempt < NAVIGATION_RETRIES):
                         await page.wait_for_timeout(RETRY_DELAY_MS * nav_attempt)
                         continue
@@ -1005,8 +1440,12 @@ async def crawl_site(browser, site, base_kwargs):
                         pass
 
                 if "/audiobooks/" in current_url and "#/b/" in current_url:
-                    book_id = current_url.split("#/b/")[1].split("&")[0].split("?")[0]
-                    await process_audiobook(site, tracker, book_id)
+                    book_id = current_url.split("#/b/")[1].split("&")[0].split("?")[0].strip()
+                    english_ids = await load_english_audiobook_index(tracker)
+                    if book_id in english_ids:
+                        await process_audiobook(site, tracker, book_id)
+                    else:
+                        print(f"      [Audio] Omitido por idioma no confirmado como inglés: {book_id}")
 
                 if "/reader.html" in current_url:
                     qs = parse_qs(urlsplit(current_url).query)
@@ -1065,6 +1504,9 @@ async def crawl_site(browser, site, base_kwargs):
                 errors.append(f"TIMEOUT | {current_url}")
                 consecutive_fails["count"] += 1
             except Exception as exc:
+                page_proxy = PAGE_PROXY_NAMES.get(id(page), ACTIVE_PROXY_NAME)
+                if is_proxy_connection_exception(exc):
+                    mark_proxy_unavailable(page_proxy, "error de conexión en navegación")
                 errors.append(f"PAGINA | {current_url} | {exc}")
                 consecutive_fails["count"] += 1
             finally:
@@ -1100,8 +1542,14 @@ async def crawl_site(browser, site, base_kwargs):
         "reintentos_de_pagina": retry_count,
         "almacenamiento_MB": format_mb(tracker["bytes_guardados"]),
         "proxy_MB": format_mb(tracker["bytes_proxy"]),
+        "trueproxies_MB": format_mb(tracker["bytes_trueproxies"]),
+        "scrapeops_MB": format_mb(tracker["bytes_scrapeops"]),
+        "oxylabs_MB": format_mb(tracker["bytes_oxylabs"]),
         "directo_MB": format_mb(tracker["bytes_direct"]),
         "requests_proxy": tracker["requests_proxy"],
+        "requests_trueproxies": tracker["requests_trueproxies"],
+        "requests_scrapeops": tracker["requests_scrapeops"],
+        "requests_oxylabs": tracker["requests_oxylabs"],
         "requests_direct": tracker["requests_direct"],
         "limite_MB": tracker["limite_mb"],
         "limite_alcanzado": tracker["limite_alcanzado"],
@@ -1111,7 +1559,9 @@ async def crawl_site(browser, site, base_kwargs):
     print("FINALIZADO:", site["name"])
     print("Páginas guardadas:", pages_saved)
     print("Disco:", format_mb(tracker["bytes_guardados"]), "MB")
-    print("Proxy:", format_mb(tracker["bytes_proxy"]), "MB |", tracker["requests_proxy"], "req")
+    print("Proxy total:", format_mb(tracker["bytes_proxy"]), "MB |", tracker["requests_proxy"], "req")
+    for provider in PROXY_ORDER:
+        print(f"{provider}:", format_mb(tracker["bytes_" + provider]), "MB |", tracker["requests_" + provider], "req")
     print("Directo:", format_mb(tracker["bytes_direct"]), "MB |", tracker["requests_direct"], "req")
     print("-" * 55)
 
@@ -1209,6 +1659,110 @@ def rewrite_css():
             errors.append(f"REESCRITURA CSS | {css_file} | {exc}")
 
 
+def rewrite_audio_json_references():
+    """Reescribe referencias del audio para que apunten a archivos guardados localmente."""
+    rewritten = 0
+
+    # Elegir la ruta local de cada lector, respetando sus query strings.
+    reader_page_by_id = {}
+    for original_url, local_path in list(url_to_file.items()):
+        try:
+            parts = urlsplit(original_url)
+            if parts.hostname == "ponn.io" and parts.path == "/reader.html":
+                book_id = parse_qs(parts.query).get("id", [""])[0]
+                if book_id:
+                    reader_page_by_id[book_id] = Path(local_path)
+        except Exception:
+            pass
+    default_reader_page = ROOT / "ponn.io" / "reader.html"
+
+    reader_index_path = url_to_file.get(clean_url(READER_AUDIO_INDEX_URL))
+    if reader_index_path and Path(reader_index_path).is_file():
+        try:
+            index_data = json.loads(Path(reader_index_path).read_text(encoding="utf-8"))
+            if isinstance(index_data, dict):
+                for book_id, book in index_data.items():
+                    if not isinstance(book, dict):
+                        continue
+                    page_path = reader_page_by_id.get(book_id, default_reader_page)
+                    for part in book.get("parts", []):
+                        if not isinstance(part, dict):
+                            continue
+                        audio_ref = part.get("audio")
+                        if isinstance(audio_ref, str):
+                            audio_url = urljoin(READER_AUDIO_INDEX_URL, audio_ref)
+                            target = find_local_target(audio_url)
+                            if target:
+                                part["audio"] = relative_target(page_path, target)
+                                rewritten += 1
+                        timings_ref = part.get("timings")
+                        if isinstance(timings_ref, str):
+                            timings_url = urljoin(READER_AUDIO_INDEX_URL, timings_ref)
+                            target = find_local_target(timings_url)
+                            if target:
+                                part["timings"] = relative_target(page_path, target)
+                                rewritten += 1
+                save_json(Path(reader_index_path), index_data)
+        except Exception as exc:
+            errors.append(f"REESCRITURA READER AUDIO JSON | {exc}")
+
+    # Reescribir las portadas del índice de audiolibros.
+    audiobook_page = url_to_file.get(clean_url("https://ponn.io/audiobooks/"), ROOT / "ponn.io" / "audiobooks" / "index.html")
+    audiobook_index_path = url_to_file.get(clean_url(AUDIOBOOK_INDEX_URL))
+    if audiobook_index_path and Path(audiobook_index_path).is_file():
+        try:
+            index_data = json.loads(Path(audiobook_index_path).read_text(encoding="utf-8"))
+            if isinstance(index_data, dict):
+                for book in index_data.values():
+                    if isinstance(book, dict) and isinstance(book.get("cover"), str):
+                        cover_url = urljoin("https://ponn.io/", book["cover"])
+                        target = find_local_target(cover_url)
+                        if target:
+                            book["cover"] = relative_target(audiobook_page, target)
+                            rewritten += 1
+                save_json(Path(audiobook_index_path), index_data)
+        except Exception as exc:
+            errors.append(f"REESCRITURA AUDIOBOOK INDEX JSON | {exc}")
+
+    # Los JSON individuales de /audiobooks/ contienen baseUrl + chapters[].file.
+    book_json_items = []
+    for original_url, local_path in list(url_to_file.items()):
+        try:
+            parts = urlsplit(original_url)
+            if (parts.hostname == "ponn.io" and
+                    parts.path.startswith("/audiobooks/data/books/") and
+                    parts.path.endswith(".json") and Path(local_path).is_file()):
+                book_json_items.append((original_url, Path(local_path)))
+        except Exception:
+            pass
+
+    for original_url, local_path in book_json_items:
+        try:
+            meta = json.loads(local_path.read_text(encoding="utf-8"))
+            base_url = meta.get("baseUrl", "")
+            chapters = meta.get("chapters", [])
+            if not isinstance(chapters, list):
+                continue
+            for chapter in chapters:
+                if not isinstance(chapter, dict) or not chapter.get("file"):
+                    continue
+                mp3_url = urljoin(base_url.rstrip("/") + "/", str(chapter["file"]))
+                target = find_local_target(mp3_url)
+                if target:
+                    chapter["file"] = relative_target(audiobook_page, target)
+                    rewritten += 1
+                else:
+                    # No falsear disponibilidad: se conserva URL completa para el capítulo no descargado.
+                    chapter["file"] = mp3_url
+            # Cada chapter.file queda con ruta local o URL absoluta de respaldo.
+            meta["baseUrl"] = ""
+            save_json(local_path, meta)
+        except Exception as exc:
+            errors.append(f"REESCRITURA AUDIOBOOK JSON | {original_url} | {exc}")
+
+    print(f"   [Audio offline] Referencias locales reescritas: {rewritten}")
+
+
 def create_offline_index():
     links = []
     for site in SITES:
@@ -1234,6 +1788,8 @@ def create_report():
         "archivos_generados": len(files),
         "tamano_total_MB": round(total_bytes / 1024 / 1024, 2),
         "errores": len(errors),
+        "reader_index_ids_con_sourceLang": len(READER_SOURCE_LANG_BY_ID),
+        "reader_index_idiomas_originales": sorted(set(READER_SOURCE_LANG_BY_ID.values())),
     }
     Path("informe-descarga.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     Path("errores-descarga.txt").write_text("\n".join(errors), encoding="utf-8")
@@ -1246,7 +1802,7 @@ async def main():
     METADATA.mkdir(parents=True, exist_ok=True)
 
     print("=" * 65)
-    print("DESCARGADOR HÍBRIDO — proxy + directo, con watchdog")
+    print("DESCARGADOR PONN — UI español + contenido original inglés")
     print("=" * 65)
 
     load_previous_maps()
@@ -1278,10 +1834,14 @@ async def main():
             }
         )
 
-        CONTEXTS["proxy"] = await browser.new_context(proxy=PROXY_CONFIG, **base_kwargs)
-        print("[Contexto] proxy:", PROXY_CONFIG["server"])
+        for provider in PROXY_ORDER:
+            CONTEXTS[provider] = await browser.new_context(proxy=PROXY_CONFIGS[provider], **base_kwargs)
+            CONTEXTS[provider].set_default_navigation_timeout(NAVIGATION_TIMEOUT)
+            CONTEXTS[provider].set_default_timeout(15000)
+            print(f"[Contexto] proxy residencial {provider} configurado")
+        CONTEXTS["proxy"] = CONTEXTS["trueproxies"]
         CONTEXTS["direct"] = await browser.new_context(**base_kwargs)
-        print("[Contexto] directo")
+        print("[Contexto] directo de respaldo")
 
         try:
             for site in SITES:
@@ -1295,6 +1855,8 @@ async def main():
     rewrite_html()
     print("\n===== REESCRITURA CSS =====")
     rewrite_css()
+    print("\n===== REESCRITURA DE REFERENCIAS DE AUDIO JSON =====")
+    rewrite_audio_json_references()
     print("\n===== ÍNDICE OFFLINE =====")
     create_offline_index()
     audit_artifact_paths()
